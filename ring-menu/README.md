@@ -38,6 +38,24 @@ Up to `RINGMENU_MAX_ITEMS` (16) items, each either:
 
 Both are copied by `ringmenu_create()`.
 
+## Grayed items
+
+Set `item.state` to `RINGMENU_ITEM_GRAYED`, or call
+`ringmenu_set_item_state()`. Grayed items are dimmed, including supplied
+images, cannot highlight or select, and leave the menu open when clicked.
+The setter returns false when asked to gray a group's selected item.
+
+## Groups
+
+`ringmenu_create_grouped()` accepts contiguous, non-overlapping
+`RingMenuGroup` ranges. Each range has one enabled `selected` item; indices
+are zero-based. Selecting another member updates that group automatically.
+Read it with `ringmenu_group_selected()` or synchronize an external mode with
+`ringmenu_set_group_selected()`.
+
+Each group has a tinted outer-rim arc. Its selected item has an inner radio
+dot. A group needs at least two items.
+
 ## Toggle lights
 
 Any slot can carry an optional **toggle light** — a small indicator centered on

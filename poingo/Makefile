@@ -34,7 +34,7 @@ CFLAGS := -std=c11 -Wall -Wextra -Wshadow -pedantic -D_GNU_SOURCE -D_DEFAULT_SOU
           -I$(CURDIR) -I$(RINGMENU_DIR) -I$(TOYAUDIO_DIR) -I$(GHOSTICON_DIR) $(WAYLAND_CFLAGS) $(TOY_AUDIO_PIPEWIRE_CFLAGS)
 LDFLAGS := $(WAYLAND_LIBS) $(TOY_AUDIO_PIPEWIRE_LIBS) -lm -lpthread
 
-.PHONY: all clean run debug icons install uninstall install-user uninstall-user test
+.PHONY: all clean run debug icons install uninstall test
 
 all: $(TARGETS)
 
@@ -87,10 +87,6 @@ test_poingo_tsan: $(TEST_DEPS)
 run: poingo
 	./poingo
 
-# Ace installs user-locally. `install-user` is the supported route; it needs
-# no sudo and keeps the toy, its desktop entry and its icons under $(HOME).
-# The `install` target below writes to $(PREFIX) and is kept only for
-# packagers -- do not use it on a working machine.
 install: poingo icon_maker icons ace-install
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 755 poingo "$(DESTDIR)$(PREFIX)/bin/poingo"
@@ -106,21 +102,6 @@ install: poingo icon_maker icons ace-install
 	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
 	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
 
-install-user: poingo icon_maker icons ace-install-user
-	install -d "$(HOME)/.local/bin"
-	install -m 755 poingo "$(HOME)/.local/bin/poingo"
-	install -m 755 poingo-logged "$(HOME)/.local/bin/poingo-logged"
-	install -m 755 poingo-audio-mark "$(HOME)/.local/bin/poingo-audio-mark"
-	install -d "$(HOME)/.local/share/applications"
-	install -m 644 poingo.desktop "$(HOME)/.local/share/applications/poingo.desktop"
-	install -d "$(HOME)/.local/share/icons/hicolor"
-	for size in $(ICON_SIZES); do \
-		install -d "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps"; \
-		install -m 644 icon_$${size}.png "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/poingo.png"; \
-	done
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true
-
 uninstall: ace-uninstall
 	$(RM) "$(DESTDIR)$(PREFIX)/bin/poingo"
 	$(RM) "$(DESTDIR)$(PREFIX)/bin/poingo-logged"
@@ -131,17 +112,6 @@ uninstall: ace-uninstall
 	done
 	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
 	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
-
-uninstall-user: ace-uninstall-user
-	$(RM) "$(HOME)/.local/bin/poingo"
-	$(RM) "$(HOME)/.local/bin/poingo-logged"
-	$(RM) "$(HOME)/.local/bin/poingo-audio-mark"
-	$(RM) "$(HOME)/.local/share/applications/poingo.desktop"
-	for size in $(ICON_SIZES); do \
-		$(RM) "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/poingo.png"; \
-	done
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true
 
 WAYLAND_PROTOCOLS_DIR ?= /usr/share/wayland-protocols
 

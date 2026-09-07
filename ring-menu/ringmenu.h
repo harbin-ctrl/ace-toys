@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define RINGMENU_MAX_ITEMS 16
+#define RINGMENU_MAX_GROUPS 8
 #define RINGMENU_LABEL_MAX 10
 #define RINGMENU_IMAGE_MAX 64   // max image width/height in px
 
@@ -15,6 +16,11 @@ enum {
     RINGMENU_BTN_RIGHT = 1,
     RINGMENU_BTN_MIDDLE = 2,
 };
+
+typedef enum {
+    RINGMENU_ITEM_ACTIVE,
+    RINGMENU_ITEM_GRAYED,
+} RingMenuItemState;
 
 #define RINGMENU_NONE (-1)
 #define RINGMENU_CANCELLED 0
@@ -30,11 +36,20 @@ typedef struct {
     const uint32_t *image;  
     int image_w, image_h;   
     int led;                
+    RingMenuItemState state;
 } RingMenuItem;
+
+typedef struct {
+    int first;
+    int count;
+    int selected;
+} RingMenuGroup;
 
 typedef struct RingMenu RingMenu;
 
 RingMenu *ringmenu_create(const RingMenuItem *items, int count);
+RingMenu *ringmenu_create_grouped(const RingMenuItem *items, int item_count,
+                                  const RingMenuGroup *groups, int group_count);
 void ringmenu_destroy(RingMenu *m);
 
 void ringmenu_open(RingMenu *m, int x, int y, int bounds_w, int bounds_h);
@@ -51,6 +66,9 @@ void ringmenu_geometry(const RingMenu *m, int *cx, int *cy, float *r0, float *r1
 void ringmenu_update_image(RingMenu *m, int index, const uint32_t *image);
 
 void ringmenu_set_led(RingMenu *m, int index, int led);
+bool ringmenu_set_item_state(RingMenu *m, int index, RingMenuItemState state);
+int ringmenu_group_selected(const RingMenu *m, int group);
+bool ringmenu_set_group_selected(RingMenu *m, int group, int item);
 
 bool ringmenu_take_dirty(RingMenu *m);
 

@@ -32,7 +32,7 @@ OBJS    := balloons.o balloon_gen.o thunder_synth.o audio.o $(COMMON)
 PREFIX := /usr/local
 BINDIR := $(PREFIX)/bin
 
-.PHONY: all clean install uninstall install-user uninstall-user icons
+.PHONY: all clean install uninstall icons
 
 all: $(TARGET)
 
@@ -103,10 +103,6 @@ icon_maker: icon_maker.o $(LODEPNG_LIB)
 icons: icon_maker
 	./icon_maker assets
 
-# Ace installs user-locally. `install-user` is the supported route; it needs
-# no sudo and keeps the toy, its desktop entry and its icons under $(HOME).
-# The `install` target below writes to $(PREFIX) and is kept only for
-# packagers -- do not use it on a working machine.
 install: $(TARGET) icons ace-install
 	install -Dm755 $(TARGET) "$(DESTDIR)$(BINDIR)/$(TARGET)"
 	install -Dm644 balloons.desktop "$(DESTDIR)$(DATADIR)/applications/balloons.desktop"
@@ -125,35 +121,3 @@ uninstall: ace-uninstall
 	done
 	update-desktop-database "$(DESTDIR)$(DATADIR)/applications" 2>/dev/null || true
 	gtk-update-icon-cache -f -t -q "$(DESTDIR)$(DATADIR)/icons/hicolor" 2>/dev/null || true
-
-install-user: $(TARGET) icons ace-install-user
-	install -d "$(HOME)/.local/bin"
-	install -m 755 $(TARGET) "$(HOME)/.local/bin/$(TARGET)"
-	install -d "$(HOME)/.local/share/applications"
-	install -m 644 balloons.desktop "$(HOME)/.local/share/applications/balloons.desktop"
-	install -d "$(HOME)/.local/share/icons/hicolor"
-	for size in $(ICON_SIZES); do \
-		install -d "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps"; \
-		install -m 644 assets/icon_$${size}x$${size}.png "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/balloons.png"; \
-	done
-	install -d "$(HOME)/.local/share/pixmaps"
-	install -m 644 assets/icon_256x256.png "$(HOME)/.local/share/pixmaps/balloons.png"
-	install -m 644 $(ACE_DIR)/ace-icon-256.png "$(HOME)/.local/share/pixmaps/ace.png"
-	install -d "$(HOME)/.icons"
-	install -m 644 assets/icon_256x256.png "$(HOME)/.icons/balloons.png"
-	install -m 644 $(ACE_DIR)/ace-icon-256.png "$(HOME)/.icons/ace.png"
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -t -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true
-
-uninstall-user: ace-uninstall-user
-	$(RM) "$(HOME)/.local/bin/$(TARGET)"
-	$(RM) "$(HOME)/.local/share/applications/balloons.desktop"
-	for size in $(ICON_SIZES); do \
-		$(RM) "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/balloons.png"; \
-	done
-	$(RM) "$(HOME)/.local/share/pixmaps/balloons.png"
-	$(RM) "$(HOME)/.local/share/pixmaps/ace.png"
-	$(RM) "$(HOME)/.icons/balloons.png"
-	$(RM) "$(HOME)/.icons/ace.png"
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -t -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true

@@ -3,8 +3,6 @@
 # own, so a toy still builds standalone, but building libs up front keeps
 # a parallel (make -jN) build correct and free of duplicate work.
 #
-# Ace installs user-locally: `make install-user`, never `sudo make
-# install`. See the install section below.
 
 ifeq ($(origin CC),default)
 CC := ccache gcc
@@ -32,7 +30,7 @@ LINT_SOURCES := \
 LINT_INCLUDES := -Itoy-audio -Iring-menu -Ishared -Isplat -Ipoingo -Iballoons -Ithird_party/lodepng
 TIDY_SOURCES := $(addprefix $(CURDIR)/,$(LINT_SOURCES))
 
-.PHONY: all libs clean install uninstall install-user uninstall-user \
+.PHONY: all libs clean install stage-install uninstall deb debs \
 	$(LIBS) $(TOYS) lint cppcheck analyzer tidy compile_commands.json
 
 all: $(TOYS)
@@ -49,15 +47,20 @@ $(TOYS): libs
 clean:
 	@for d in $(LIBS) $(TOYS); do $(MAKE) -C $$d clean; done
 
-# Install/uninstall are toy-only; the toys pull in the shared Ace
-# menu category through ace-packaging/install.mk themselves.
-#
-# Ace is installed user-locally, not to the system: `make install-user`
-# puts everything under $(HOME) and needs no sudo. `install` writes to
-# $(PREFIX) and exists for packagers only -- do not run it on a working
-# machine, where a stale system copy silently shadows the user one.
-install install-user uninstall uninstall-user:
-	@for d in $(TOYS); do $(MAKE) -C $$d $@ || exit $$?; done
+stage-install:
+	@for d in $(TOYS); do $(MAKE) -C $$d install || exit $$?; done
+
+deb:
+	@set -euo pipefail; \
+	dpkg-checkbuilddeps debian/control; \
+	dpkg-buildpackage -b -uc -us
+
+debs: deb
+
+install: deb
+	@set -euo pipefail; \
+	package=../ace-toys_$$(dpkg-parsechangelog -SVersion)_$$(dpkg --print-architecture).deb; \
+	if [ "$$(id -u)" -eq 0 ]; then apt install -y "$$package"; else sudo apt install -y "$$package"; fi
 
 lint:
 	$(MAKE) cppcheck

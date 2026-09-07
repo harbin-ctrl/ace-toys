@@ -4769,6 +4769,9 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
             g_picker_slot = -1;
             g_picker_locked = false;
             poingo_menu_sync_drops();
+            ringmenu_set_item_state(g_menu, POINGO_MENU_ADD_BALL - 1,
+                                    st->ball_count >= POINGO_MAX_BALLS
+                                    ? RINGMENU_ITEM_GRAYED : RINGMENU_ITEM_ACTIVE);
             ringmenu_set_led(g_menu, POINGO_MENU_MUTE - 1,
                              g_mixer.muted ? RINGMENU_LED_ON : RINGMENU_LED_OFF);
             ringmenu_set_led(g_menu, POINGO_MENU_GHOST - 1,

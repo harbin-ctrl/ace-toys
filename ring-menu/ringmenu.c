@@ -102,6 +102,14 @@ static const uint8_t RM_BG[4]     = {34, 36, 42, 235};    // wedge
 static const uint8_t RM_HI[4]     = {66, 120, 230, 245};  // highlighted wedge
 static const uint8_t RM_BORDER[4] = {150, 155, 165, 255}; // outlines/separators
 static const uint8_t RM_TEXT[4]   = {235, 235, 240, 255};
+static const uint8_t RM_GRAY_BG[4] = {25, 26, 30, 180};
+static const uint8_t RM_GRAY_TEXT[4] = {120, 120, 125, 160};
+static const uint8_t RM_GROUP[4] = {50, 92, 150, 245};
+static const uint8_t RM_RADIO[4] = {214, 230, 255, 255};
+
+#define RM_GROUP_RIM 7.0f
+#define RM_RADIO_RADIUS 3.5f
+#define RM_RADIO_GAP 6.0f
 
 // Toggle light ("LED") look and placement. The light sits on the slot's
 // bisector at RM_LED_FRAC of the way out to the label; its band outer radius
@@ -123,7 +131,13 @@ struct RingMenu {
         uint32_t *image;    // NULL for text items
         int cw, ch;         // content (label or image) size in px
         int led;            // RINGMENU_LED_* toggle-light state
+        RingMenuItemState state;
     } items[RINGMENU_MAX_ITEMS];
+    struct {
+        int first, count, selected;
+    } groups[RINGMENU_MAX_GROUPS];
+    int group_count;
+    int group_of[RINGMENU_MAX_ITEMS];
 
     float r0, r1;   // inner/outer ring radius
     float rc;       // radius the content centers sit on
@@ -227,6 +241,14 @@ static int rm_hit(const RingMenu *m, int x, int y) {
     return rm_slot_of(m, fx, fy);
 }
 
+static bool rm_active(const RingMenu *m, int slot) {
+    return m->items[slot].state == RINGMENU_ITEM_ACTIVE;
+}
+
+static int rm_group_of(const RingMenu *m, int slot) {
+    return m->group_of[slot];
+}
+
 // ---------------------------------------------------------------------------
 // Rendering (into the internal buffer)
 // ---------------------------------------------------------------------------
@@ -234,8 +256,10 @@ static int rm_hit(const RingMenu *m, int x, int y) {
 // Content always fits by construction (see the sizing in ringmenu_create),
 // but both writers still clip to the buffer for safety.
 
-static void rm_draw_label(RingMenu *m, const char *label, int x0, int y0) {
-    uint32_t ink = rm_pack(RM_TEXT, RM_TEXT[3]);
+static void rm_draw_label(RingMenu *m, const char *label, int x0, int y0,
+                          RingMenuItemState state) {
+    const uint8_t *color = state == RINGMENU_ITEM_GRAYED ? RM_GRAY_TEXT : RM_TEXT;
+    uint32_t ink = rm_pack(color, color[3]);
     for (int i = 0; label[i]; i++) {
         const uint8_t *rows = RM_FONT[rm_glyph_index(label[i])];
         int gx = x0 + i * RM_ADVANCE * RM_SCALE;
@@ -255,7 +279,7 @@ static void rm_draw_label(RingMenu *m, const char *label, int x0, int y0) {
 }
 
 static void rm_draw_image(RingMenu *m, const uint32_t *img, int iw, int ih,
-                          int x0, int y0) {
+                          int x0, int y0, RingMenuItemState state) {
     for (int y = 0; y < ih; y++) {
         int py = y0 + y;
         if (py < 0 || py >= m->size) continue;
@@ -264,7 +288,15 @@ static void rm_draw_image(RingMenu *m, const uint32_t *img, int iw, int ih,
         for (int x = 0; x < iw; x++) {
             int px = x0 + x;
             if (px < 0 || px >= m->size) continue;
-            row[px] = rm_over(src[x], row[px]);
+            uint32_t pixel = src[x];
+            if (state == RINGMENU_ITEM_GRAYED) {
+                uint32_t r = pixel & 0xFF;
+                uint32_t g = (pixel >> 8) & 0xFF;
+                uint32_t b = (pixel >> 16) & 0xFF;
+                uint32_t gray = (r * 30 + g * 59 + b * 11) / 100;
+                pixel = gray | (gray << 8) | (gray << 16) | ((pixel >> 1) & 0xFF000000);
+            }
+            row[px] = rm_over(pixel, row[px]);
         }
     }
 }
@@ -279,6 +311,23 @@ static void rm_led_blend(RingMenu *m, int px, int py,
     uint32_t src = rm_pack(col, (uint8_t)(a * 255.0f + 0.5f));
     uint32_t *row = m->pix + (size_t)py * m->size;
     row[px] = rm_over(src, row[px]);
+}
+
+static void rm_draw_radio(RingMenu *m, float cx, float cy) {
+    int x0 = (int)floorf(cx - RM_RADIO_RADIUS);
+    int x1 = (int)ceilf(cx + RM_RADIO_RADIUS);
+    int y0 = (int)floorf(cy - RM_RADIO_RADIUS);
+    int y1 = (int)ceilf(cy + RM_RADIO_RADIUS);
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float dx = (float)x + 0.5f - cx;
+            float dy = (float)y + 0.5f - cy;
+            float cov = rm_clamp01(RM_RADIO_RADIUS + 0.5f - sqrtf(dx * dx + dy * dy));
+            if (cov > 0.0f) {
+                rm_led_blend(m, x, y, RM_RADIO[0], RM_RADIO[1], RM_RADIO[2], cov);
+            }
+        }
+    }
 }
 
 // A toggle light centered at (lx, ly): a dark-silver band around either a
@@ -371,6 +420,9 @@ static void rm_render_bg(RingMenu *m, uint32_t *dst) {
 
             int slot = rm_slot_of(m, fx, fy);
             const uint8_t *base = (slot == m->highlight) ? RM_HI : RM_BG;
+            if (slot != m->highlight && !rm_active(m, slot)) {
+                base = RM_GRAY_BG;
+            }
 
             // Border: the two ring outlines plus the wedge separators,
             // each about 1px wide with a soft falloff.
@@ -391,6 +443,12 @@ static void rm_render_bg(RingMenu *m, uint32_t *dst) {
             float cg = base[1] + (RM_BORDER[1] - base[1]) * border;
             float cb = base[2] + (RM_BORDER[2] - base[2]) * border;
             float ca = base[3] + (RM_BORDER[3] - base[3]) * border;
+            if (rm_group_of(m, slot) >= 0 && r > m->r1 - RM_GROUP_RIM) {
+                float tint = rm_clamp01((r - (m->r1 - RM_GROUP_RIM)) / RM_GROUP_RIM) * 0.45f;
+                cr += (RM_GROUP[0] - cr) * tint;
+                cg += (RM_GROUP[1] - cg) * tint;
+                cb += (RM_GROUP[2] - cb) * tint;
+            }
             uint8_t out[4] = {(uint8_t)cr, (uint8_t)cg, (uint8_t)cb, 0};
             row[x] = rm_pack(out, (uint8_t)(ca * cov));
         }
@@ -419,19 +477,29 @@ static void rm_render(RingMenu *m) {
         int py = (int)lroundf(c + m->rc * sinf(ang) - m->items[i].ch / 2.0f);
         if (m->items[i].image) {
             rm_draw_image(m, m->items[i].image, m->items[i].cw,
-                          m->items[i].ch, px, py);
+                          m->items[i].ch, px, py, m->items[i].state);
         } else if (m->items[i].label[0]) {
-            rm_draw_label(m, m->items[i].label, px, py);
+            rm_draw_label(m, m->items[i].label, px, py, m->items[i].state);
         }
     }
 
     // Toggle lights, drawn over the wedge between each slot's center and label.
     for (int i = 0; i < m->count; i++) {
-        if (m->items[i].led == RINGMENU_LED_NONE) continue;
+        if (m->items[i].led == RINGMENU_LED_NONE || !rm_active(m, i)) {
+            continue;
+        }
         float ang = -RM_PI / 2.0f + (float)i * 2.0f * half;
         float r_led = RM_LED_FRAC * m->rc;
         rm_draw_led(m, c + r_led * cosf(ang), c + r_led * sinf(ang),
                     m->items[i].led == RINGMENU_LED_ON);
+    }
+
+    // A radio dot identifies the one active item in each related arc.
+    for (int i = 0; i < m->group_count; i++) {
+        int slot = m->groups[i].selected;
+        float ang = -RM_PI / 2.0f + (float)slot * 2.0f * half;
+        float r = m->r0 + RM_RADIO_GAP + RM_RADIO_RADIUS;
+        rm_draw_radio(m, c + r * cosf(ang), c + r * sinf(ang));
     }
 }
 
@@ -439,13 +507,61 @@ static void rm_render(RingMenu *m) {
 // Public API
 // ---------------------------------------------------------------------------
 
-RingMenu *ringmenu_create(const RingMenuItem *items, int count) {
+static bool rm_groups_valid(const RingMenuItem *items, int item_count,
+                            const RingMenuGroup *groups, int group_count) {
+    if (group_count < 0 || group_count > RINGMENU_MAX_GROUPS) {
+        return false;
+    }
+    if (group_count > 0 && !groups) {
+        return false;
+    }
+
+    int owner[RINGMENU_MAX_ITEMS];
+    for (int i = 0; i < item_count; i++) {
+        owner[i] = -1;
+    }
+    for (int i = 0; i < group_count; i++) {
+        int first = groups[i].first;
+        int count = groups[i].count;
+        int selected = groups[i].selected;
+        if (count < 2 || first < 0 || first + count > item_count ||
+            selected < first || selected >= first + count ||
+            items[selected].state == RINGMENU_ITEM_GRAYED) {
+            return false;
+        }
+        for (int slot = first; slot < first + count; slot++) {
+            if (owner[slot] >= 0) {
+                return false;
+            }
+            owner[slot] = i;
+        }
+    }
+    return true;
+}
+
+static RingMenu *rm_create(const RingMenuItem *items, int count,
+                           const RingMenuGroup *groups, int group_count) {
     if (!items || count < 1 || count > RINGMENU_MAX_ITEMS) return NULL;
+    if (!rm_groups_valid(items, count, groups, group_count)) {
+        return NULL;
+    }
 
     RingMenu *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
     m->count = count;
     m->highlight = -1;
+    for (int i = 0; i < count; i++) {
+        m->group_of[i] = -1;
+    }
+    m->group_count = group_count;
+    for (int i = 0; i < group_count; i++) {
+        m->groups[i].first = groups[i].first;
+        m->groups[i].count = groups[i].count;
+        m->groups[i].selected = groups[i].selected;
+        for (int slot = groups[i].first; slot < groups[i].first + groups[i].count; slot++) {
+            m->group_of[slot] = i;
+        }
+    }
 
     for (int i = 0; i < count; i++) {
         if (items[i].image) {
@@ -477,6 +593,8 @@ RingMenu *ringmenu_create(const RingMenuItem *items, int count) {
         int led = items[i].led;
         m->items[i].led = (led < RINGMENU_LED_NONE || led > RINGMENU_LED_ON)
                               ? RINGMENU_LED_NONE : led;
+        m->items[i].state = items[i].state == RINGMENU_ITEM_GRAYED
+                            ? RINGMENU_ITEM_GRAYED : RINGMENU_ITEM_ACTIVE;
     }
 
     // Size the ring so every item fits inside its wedge. Content is drawn
@@ -557,6 +675,15 @@ RingMenu *ringmenu_create(const RingMenuItem *items, int count) {
     return m;
 }
 
+RingMenu *ringmenu_create(const RingMenuItem *items, int count) {
+    return rm_create(items, count, NULL, 0);
+}
+
+RingMenu *ringmenu_create_grouped(const RingMenuItem *items, int item_count,
+                                  const RingMenuGroup *groups, int group_count) {
+    return rm_create(items, item_count, groups, group_count);
+}
+
 void ringmenu_destroy(RingMenu *m) {
     if (!m) return;
     for (int i = 0; i < m->count; i++) free(m->items[i].image);
@@ -601,6 +728,9 @@ int ringmenu_motion(RingMenu *m, int x, int y) {
     m->last_x = x;
     m->last_y = y;
     int slot = rm_hit(m, x, y);
+    if (slot >= 0 && !rm_active(m, slot)) {
+        slot = -1;
+    }
     if (slot != m->highlight) {
         m->highlight = slot;
         m->dirty = true;
@@ -627,6 +757,13 @@ int ringmenu_button(RingMenu *m, int button, bool pressed) {
     if ((button == RINGMENU_BTN_RIGHT && !pressed) ||
         (button == RINGMENU_BTN_LEFT && pressed)) {
         int slot = rm_hit(m, m->last_x, m->last_y);
+        if (slot >= 0 && !rm_active(m, slot)) {
+            return RINGMENU_NONE;
+        }
+        int group = slot >= 0 ? rm_group_of(m, slot) : -1;
+        if (group >= 0) {
+            m->groups[group].selected = slot;
+        }
         return rm_close(m, slot < 0 ? RINGMENU_CANCELLED : slot + 1);
     }
     return RINGMENU_NONE;
@@ -667,6 +804,53 @@ void ringmenu_set_led(RingMenu *m, int index, int led) {
     m->items[index].led = led;
     m->dirty = true;
     m->needs_render = true;
+}
+
+bool ringmenu_set_item_state(RingMenu *m, int index, RingMenuItemState state) {
+    if (!m || index < 0 || index >= m->count ||
+        (state != RINGMENU_ITEM_ACTIVE && state != RINGMENU_ITEM_GRAYED)) {
+        return false;
+    }
+    int group = rm_group_of(m, index);
+    if (state == RINGMENU_ITEM_GRAYED && group >= 0 &&
+        m->groups[group].selected == index) {
+        return false;
+    }
+    if (m->items[index].state == state) {
+        return true;
+    }
+
+    m->items[index].state = state;
+    if (m->highlight == index && state == RINGMENU_ITEM_GRAYED) {
+        m->highlight = -1;
+    }
+    m->dirty = true;
+    m->needs_render = true;
+    return true;
+}
+
+int ringmenu_group_selected(const RingMenu *m, int group) {
+    if (!m || group < 0 || group >= m->group_count) {
+        return RINGMENU_NONE;
+    }
+    return m->groups[group].selected;
+}
+
+bool ringmenu_set_group_selected(RingMenu *m, int group, int item) {
+    if (!m || group < 0 || group >= m->group_count ||
+        item < m->groups[group].first ||
+        item >= m->groups[group].first + m->groups[group].count ||
+        !rm_active(m, item)) {
+        return false;
+    }
+    if (m->groups[group].selected == item) {
+        return true;
+    }
+
+    m->groups[group].selected = item;
+    m->dirty = true;
+    m->needs_render = true;
+    return true;
 }
 
 bool ringmenu_take_dirty(RingMenu *m) {

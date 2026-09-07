@@ -1,0 +1,11 @@
+Source: ace-toys
+Section: games
+Priority: optional
+Maintainer: Ace <ace@localhost>
+Build-Depends: debhelper-compat (= 13), gcc, make, pkg-config, libwayland-dev, libegl-dev, libgles2-mesa-dev, libpipewire-0.3-dev, libxkbcommon-dev, wayland-protocols
+Standards-Version: 4.6.2
+
+Package: ace-toys
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Ace desktop toys

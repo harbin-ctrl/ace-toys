@@ -41,7 +41,7 @@ CFLAGS := -std=c11 -Wall -Wextra -Wshadow -pedantic -D_GNU_SOURCE -D_DEFAULT_SOU
           -I$(TOYAUDIO_DIR) -I$(GHOSTICON_DIR) $(WAYLAND_CFLAGS) $(TOY_AUDIO_PIPEWIRE_CFLAGS)
 LDFLAGS := $(WAYLAND_LIBS) $(TOY_AUDIO_PIPEWIRE_LIBS) -lm -lpthread
 
-.PHONY: all clean run icons install install-user uninstall uninstall-user test
+.PHONY: all clean run icons install uninstall test
 
 all: $(TARGETS)
 
@@ -100,10 +100,6 @@ test_engine: test_engine.c splat.c spraycan.h \
 		$(TOYAUDIO_LIB) $(GHOSTICON_LIB) -o $@ $(WAYLAND_LIBS) \
 		$(TOY_AUDIO_PIPEWIRE_LIBS) -lm -lpthread
 
-# Ace installs user-locally. `install-user` is the supported route; it needs
-# no sudo and keeps the toy, its desktop entry and its icons under $(HOME).
-# The `install` target below writes to $(PREFIX) and is kept only for
-# packagers -- do not use it on a working machine.
 install: splat icons ace-install
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 755 splat "$(DESTDIR)$(PREFIX)/bin/splat"
@@ -117,20 +113,6 @@ install: splat icons ace-install
 	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
 	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
 
-install-user: splat icons ace-install-user
-	install -d "$(HOME)/.local/bin"
-	install -m 755 splat "$(HOME)/.local/bin/splat"
-	install -d "$(HOME)/.local/share/applications"
-	install -m 644 splat.desktop "$(HOME)/.local/share/applications/splat.desktop"
-	install -d "$(HOME)/.local/share/icons/hicolor"
-	for size in $(ICON_SIZES); do \
-		install -d "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps"; \
-		install -m 644 icon_$${size}.png "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/splat.png"; \
-	done
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	test -f "$(HOME)/.local/share/icons/hicolor/index.theme" || cp /usr/share/icons/hicolor/index.theme "$(HOME)/.local/share/icons/hicolor/" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true
-
 uninstall: ace-uninstall
 	$(RM) "$(DESTDIR)$(PREFIX)/bin/splat"
 	$(RM) "$(DESTDIR)$(PREFIX)/share/applications/splat.desktop"
@@ -139,17 +121,6 @@ uninstall: ace-uninstall
 	done
 	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
 	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
-
-# index.theme is deliberately left: install-user only supplies it when the
-# user has no hicolor theme at all, and every other icon there needs it.
-uninstall-user: ace-uninstall-user
-	$(RM) "$(HOME)/.local/bin/splat"
-	$(RM) "$(HOME)/.local/share/applications/splat.desktop"
-	for size in $(ICON_SIZES); do \
-		$(RM) "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/splat.png"; \
-	done
-	update-desktop-database "$(HOME)/.local/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(HOME)/.local/share/icons/hicolor" 2>/dev/null || true
 
 clean:
 	$(RM) $(TARGETS) test_engine $(SPLAT_SRC:.c=.o) icon_maker.o test_engine.o $(LODEPNG_LIB) $(ICON_PNGS)

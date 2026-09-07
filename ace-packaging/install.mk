@@ -3,11 +3,11 @@
 #
 # Include from a toy's Makefile:
 #
-#   ACE_DIR ?= $(HOME)/ace-packaging
+#   ACE_DIR ?= $(CURDIR)/../ace-packaging
 #   include $(ACE_DIR)/install.mk
 #
 # then make the toy's `install` target depend on `ace-install`
-# (honors DESTDIR/PREFIX) and `install-user` on `ace-install-user`.
+# (honors DESTDIR/PREFIX).
 # Run your update-desktop-database / gtk-update-icon-cache refresh in the
 # toy's target as before.
 #
@@ -23,8 +23,7 @@ ACE_ICON_SIZES := 16 22 24 32 48 64 128 256 512
 ACE_TOYS := splat poingo balloons
 ACE_OWNER := $(notdir $(CURDIR))
 
-.PHONY: ace-install ace-install-user \
-        ace-uninstall ace-uninstall-user
+.PHONY: ace-install ace-uninstall
 
 ace-install:
 	install -d "$(DESTDIR)$(PREFIX)/share/desktop-directories"
@@ -39,20 +38,6 @@ ace-install:
 	done
 	install -d "$(DESTDIR)$(PREFIX)/share/ace/.owners"
 	touch "$(DESTDIR)$(PREFIX)/share/ace/.owners/$(ACE_OWNER)"
-
-ace-install-user:
-	install -d "$(HOME)/.local/share/desktop-directories"
-	install -m 644 "$(ACE_DIR)/Ace.directory" "$(HOME)/.local/share/desktop-directories/Ace.directory"
-	install -d "$(HOME)/.config/menus/applications-merged"
-	install -m 644 "$(ACE_DIR)/ace.menu" "$(HOME)/.config/menus/applications-merged/ace.menu"
-	install -d "$(HOME)/.config/menus/rpd-applications-merged"
-	install -m 644 "$(ACE_DIR)/ace.menu" "$(HOME)/.config/menus/rpd-applications-merged/ace.menu"
-	for size in $(ACE_ICON_SIZES); do \
-		install -d "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps"; \
-		install -m 644 "$(ACE_DIR)/ace-icon-$${size}.png" "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/ace.png"; \
-	done
-	install -d "$(HOME)/.local/share/ace/.owners"
-	touch "$(HOME)/.local/share/ace/.owners/$(ACE_OWNER)"
 
 ace-uninstall:
 	owners="$(DESTDIR)$(PREFIX)/share/ace/.owners"; \
@@ -70,24 +55,6 @@ ace-uninstall:
 			$(RM) "$(DESTDIR)$(PREFIX)/share/icons/hicolor/$${size}x$${size}/apps/ace.png"; \
 		done; \
 		rmdir "$$owners" "$(DESTDIR)$(PREFIX)/share/ace" 2>/dev/null || true; \
-	fi
-
-ace-uninstall-user:
-	owners="$(HOME)/.local/share/ace/.owners"; \
-	owner="$$owners/$(ACE_OWNER)"; \
-	$(RM) "$$owner"; \
-	keep=0; \
-	for toy in $(ACE_TOYS); do \
-		if [ "$$toy" != "$(ACE_OWNER)" ] && [ -f "$(HOME)/.local/share/applications/$$toy.desktop" ]; then keep=1; fi; \
-	done; \
-	if [ "$$keep" -eq 0 ] && [ -d "$$owners" ] && [ -z "$$(find "$$owners" -type f -print -quit)" ]; then \
-		$(RM) "$(HOME)/.local/share/desktop-directories/Ace.directory"; \
-		$(RM) "$(HOME)/.config/menus/applications-merged/ace.menu"; \
-		$(RM) "$(HOME)/.config/menus/rpd-applications-merged/ace.menu"; \
-		for size in $(ACE_ICON_SIZES); do \
-			$(RM) "$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/ace.png"; \
-		done; \
-		rmdir "$$owners" "$(HOME)/.local/share/ace" 2>/dev/null || true; \
 	fi
 
 .DEFAULT_GOAL := $(ACE_SAVED_GOAL)

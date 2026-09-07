@@ -1756,32 +1756,31 @@ static bool create_color_menu(PaintState *st) {
         items[i].image_h = MENU_DISC_SIZE;
     }
     items[MENU_RESULT_SPRAY - 1].label = "SPRAY";
-    items[MENU_RESULT_SPRAY - 1].led = RINGMENU_LED_OFF;
     items[MENU_RESULT_SPLAT - 1].label = "SPLAT";
-    items[MENU_RESULT_SPLAT - 1].led = RINGMENU_LED_OFF;
     items[MENU_RESULT_ERASER - 1].label = "ERASER";
-    items[MENU_RESULT_ERASER - 1].led = RINGMENU_LED_OFF;
     items[MENU_RESULT_GHOST - 1].label = "GHOST";
     items[MENU_RESULT_GHOST - 1].led = RINGMENU_LED_OFF;
     items[MENU_RESULT_CLEAR - 1].label = "CLEAR";
     items[MENU_RESULT_QUIT - 1].label = "QUIT";
-    if (ok) st->menu = ringmenu_create(items, MENU_ITEMS);
+    RingMenuGroup modes = {
+        .first = MENU_RESULT_SPRAY - 1,
+        .count = 3,
+        .selected = MENU_RESULT_SPRAY - 1,
+    };
+    if (ok) {
+        st->menu = ringmenu_create_grouped(items, MENU_ITEMS, &modes, 1);
+    }
     return st->menu != NULL;
 }
 
 static void sync_menu_mode_leds(PaintState *st) {
     if (!st->menu) return;
-    int active = !st->paint_mode  ? MENU_RESULT_GHOST
-               : st->eraser_mode  ? MENU_RESULT_ERASER
+    int selected = st->eraser_mode  ? MENU_RESULT_ERASER
                : st->tool == TOOL_SPLAT ? MENU_RESULT_SPLAT
                                         : MENU_RESULT_SPRAY;
-    const int modes[4] = { MENU_RESULT_SPRAY, MENU_RESULT_SPLAT,
-                           MENU_RESULT_ERASER, MENU_RESULT_GHOST };
-    for (int i = 0; i < 4; i++) {
-        ringmenu_set_led(st->menu, modes[i] - 1,
-                         modes[i] == active ? RINGMENU_LED_ON
-                                            : RINGMENU_LED_NONE);
-    }
+    ringmenu_set_group_selected(st->menu, 0, selected - 1);
+    ringmenu_set_led(st->menu, MENU_RESULT_GHOST - 1,
+                     st->paint_mode ? RINGMENU_LED_OFF : RINGMENU_LED_ON);
 }
 
 static void menu_closed(PaintState *st, int result) {
