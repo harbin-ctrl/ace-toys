@@ -19,7 +19,7 @@
 
 // ---------------------------------------------------------------------------
 // Built-in font: 5x7 small caps, drawn at 2x (10x14 px per glyph).
-// Glyph order: A-Z, 0-9, dash, space. Each row byte holds 5 pixels, bit 4
+// Glyph order: A-Z, 0-9, dash, plus, space. Each row byte holds 5 pixels, bit 4
 // is the leftmost column.
 // ---------------------------------------------------------------------------
 
@@ -27,9 +27,9 @@
 #define RM_GLYPH_H 7
 #define RM_SCALE 2
 #define RM_ADVANCE (RM_GLYPH_W + 1)   // one blank column between glyphs
-#define RM_GLYPH_SPACE 37             // index of the blank glyph
+#define RM_GLYPH_SPACE 38             // index of the blank glyph
 
-static const uint8_t RM_FONT[38][RM_GLYPH_H] = {
+static const uint8_t RM_FONT[39][RM_GLYPH_H] = {
     {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, // A
     {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B
     {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // C
@@ -67,14 +67,26 @@ static const uint8_t RM_FONT[38][RM_GLYPH_H] = {
     {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 8
     {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
     {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, // -
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}, // +
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // space
 };
 
 static int rm_glyph_index(char c) {
-    if (c >= 'a' && c <= 'z') return c - 'a';
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= '0' && c <= '9') return 26 + (c - '0');
-    if (c == '-') return 36;
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a';
+    }
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= '0' && c <= '9') {
+        return 26 + (c - '0');
+    }
+    if (c == '-') {
+        return 36;
+    }
+    if (c == '+') {
+        return 37;
+    }
     return RM_GLYPH_SPACE;
 }
 

@@ -102,6 +102,176 @@ static void test_damping_does_not_overshoot(void) {
     g_speed_multiplier = 1.0f;
 }
 
+static PoingoBall test_ball(float x, float y, float diameter,
+                            float vx, float vy) {
+    PoingoBall ball = {
+        .x = x,
+        .y = y,
+        .vx = fabsf(vx),
+        .vy = vy / (float)TEST_WINDOW_H,
+        .vx_direction = vx < 0.0f ? -1 : 1,
+        .scale = 1.0f,
+        .diameter = diameter,
+        .diameter_norm = diameter / (float)TEST_WINDOW_H,
+        .mode = BALL_MODE_POINGO,
+    };
+    return ball;
+}
+
+static float signed_vx(const PoingoBall *ball) {
+    return ball->vx * (float)ball->vx_direction;
+}
+
+/* Equal hollow shells exchange direction; unequal shells use diameter squared
+   as mass, proportional to spherical surface area. */
+static void test_ball_collision_mass(void) {
+    FreedomState st = {
+        .width = TEST_WINDOW_W,
+        .height = TEST_WINDOW_H,
+        .grabbed_ball = -1,
+        .ball_count = 2,
+    };
+    st.balls[0] = test_ball(100.0f, 0.3f, 100.0f, 5.0f, 0.0f);
+    st.balls[1] = test_ball(190.0f, 0.3f, 100.0f, -5.0f, 0.0f);
+
+    solve_ball_pair(&st, 0, 1, BALL_SOUND_SILENT);
+
+    CHECK(fabsf(signed_vx(&st.balls[0]) + 4.7f) < 0.01f,
+          "equal ball A velocity %.3f", (double)signed_vx(&st.balls[0]));
+    CHECK(fabsf(signed_vx(&st.balls[1]) - 4.7f) < 0.01f,
+          "equal ball B velocity %.3f", (double)signed_vx(&st.balls[1]));
+
+    st.balls[0] = test_ball(100.0f, 0.3f, 100.0f, 10.0f, 0.0f);
+    st.balls[1] = test_ball(190.0f, 166.0f / TEST_WINDOW_H,
+                            200.0f, 0.0f, 0.0f);
+    solve_ball_pair(&st, 0, 1, BALL_SOUND_SILENT);
+
+    CHECK(fabsf(signed_vx(&st.balls[0]) + 5.52f) < 0.01f,
+          "small ball velocity %.3f", (double)signed_vx(&st.balls[0]));
+    CHECK(fabsf(signed_vx(&st.balls[1]) - 3.88f) < 0.01f,
+          "large ball velocity %.3f", (double)signed_vx(&st.balls[1]));
+}
+
+/* A grabbed ball is kinematic: it keeps the pointer's velocity while still
+   transferring energy to balls it strikes. */
+static void test_grabbed_ball_strikes(void) {
+    FreedomState st = {
+        .width = TEST_WINDOW_W,
+        .height = TEST_WINDOW_H,
+        .grabbed_ball = 0,
+        .ball_count = 2,
+    };
+    st.balls[0] = test_ball(100.0f, 0.3f, 100.0f, 10.0f, 0.0f);
+    st.balls[1] = test_ball(190.0f, 0.3f, 100.0f, 0.0f, 0.0f);
+
+    solve_ball_pair(&st, 0, 1, BALL_SOUND_SILENT);
+
+    CHECK(fabsf(signed_vx(&st.balls[0]) - 10.0f) < 0.01f,
+          "grabbed ball velocity %.3f", (double)signed_vx(&st.balls[0]));
+    CHECK(signed_vx(&st.balls[1]) > 19.0f,
+          "struck ball velocity %.3f", (double)signed_vx(&st.balls[1]));
+
+    st.balls[0] = test_ball(100.0f, 0.3f, 100.0f, 300.0f, 0.0f);
+    st.balls[1] = test_ball(400.0f, 0.3f, 100.0f, 0.0f, 0.0f);
+    sweep_grabbed_ball(&st, 100.0f, 0.3f, 500.0f, 0.3f);
+    CHECK(signed_vx(&st.balls[1]) > 0.0f,
+          "grabbed ball tunneled through target");
+}
+
+/* Substeps keep a fast ball from crossing another between frames. */
+static void test_fast_ball_collision(void) {
+    FreedomState st = {
+        .width = TEST_WINDOW_W,
+        .height = TEST_WINDOW_H,
+        .grabbed_ball = -1,
+        .ball_count = 2,
+    };
+    st.balls[0] = test_ball(100.0f, 0.3f, 100.0f, 300.0f, 0.0f);
+    st.balls[1] = test_ball(400.0f, 0.3f, 100.0f, 0.0f, 0.0f);
+    g_speed_multiplier = 1.0f;
+
+    step_balls(&st, 1.0 / 60.0, BALL_SOUND_SILENT);
+
+    CHECK(signed_vx(&st.balls[1]) > 0.0f,
+          "fast ball tunneled through target");
+}
+
+static void test_add_remove_balls(void) {
+    FreedomState st = {
+        .width = TEST_WINDOW_W,
+        .height = TEST_WINDOW_H,
+        .grabbed_ball = -1,
+        .menu_ball = -1,
+    };
+    srandom(7);
+    for (int i = 0; i < POINGO_MAX_BALLS; i++) {
+        CHECK(add_ball(&st), "add %d failed", i);
+    }
+    CHECK(st.ball_count == POINGO_MAX_BALLS, "ball count %d", st.ball_count);
+    CHECK(!add_ball(&st), "accepted a seventh ball");
+
+    for (int a = 0; a < st.ball_count; a++) {
+        CHECK(st.balls[a].x >= 0.0f &&
+              st.balls[a].x + st.balls[a].diameter <= st.width,
+              "ball %d outside horizontal bounds", a);
+        CHECK(st.balls[a].y >= 0.0f &&
+              st.balls[a].y + st.balls[a].diameter_norm <= 1.0f,
+              "ball %d outside vertical bounds", a);
+        for (int b = a + 1; b < st.ball_count; b++) {
+            CHECK(ball_fits(&(FreedomState){
+                      .width = st.width,
+                      .height = st.height,
+                      .balls = {st.balls[a]},
+                      .ball_count = 1,
+                  }, &st.balls[b]),
+                  "balls %d and %d overlap", a, b);
+        }
+    }
+
+    int removed = st.ball_count - 1;
+    remove_ball(&st, removed);
+    CHECK(st.ball_count == POINGO_MAX_BALLS - 1,
+          "remove left %d balls", st.ball_count);
+}
+
+static void test_targeted_ball_actions(void) {
+    FreedomState st = {
+        .width = TEST_WINDOW_W,
+        .height = TEST_WINDOW_H,
+        .grabbed_ball = 1,
+        .menu_ball = 1,
+        .ball_count = 2,
+    };
+    st.balls[0] = test_ball(100.0f, 0.2f, 100.0f, 1.0f, 0.0f);
+    st.balls[1] = test_ball(300.0f, 0.2f, 100.0f, 1.0f, 0.0f);
+    st.balls[0].scale = 0.5f;
+    st.balls[1].scale = 0.5f;
+    st.pointer_x = 350;
+    st.pointer_y = 194;
+    st.grab_u = 0.5f;
+    st.grab_v = 0.5f;
+
+    freerange_adjust_ball_scale(&st, 1);
+
+    CHECK(st.balls[0].scale == 0.5f, "wheel resized the wrong ball");
+    CHECK(fabsf(st.balls[1].scale - 0.55f) < 0.001f,
+          "wheel missed the grabbed ball");
+    set_ball_mode(&st.balls[1], BALL_MODE_NOSTALGIA);
+    CHECK(st.balls[0].mode == BALL_MODE_POINGO,
+          "mode changed the wrong ball");
+    CHECK(st.balls[1].mode == BALL_MODE_NOSTALGIA,
+          "mode missed the target ball");
+
+    st.grabbed_ball = -1;
+    PoingoBall kept = st.balls[1];
+    remove_ball(&st, 0);
+    CHECK(st.ball_count == 1, "targeted remove left %d balls", st.ball_count);
+    CHECK(memcmp(&st.balls[0], &kept, sizeof(kept)) == 0,
+          "targeted remove kept the wrong ball");
+    remove_ball(&st, 0);
+    CHECK(st.shutdown_pending, "last-ball remove did not request shutdown");
+}
+
 /* ------------------------------------------------------------------ */
 /* Command line                                                        */
 /* ------------------------------------------------------------------ */
@@ -292,6 +462,11 @@ int main(void) {
 
     test_fast_ball_stays_in_window();
     test_damping_does_not_overshoot();
+    test_ball_collision_mass();
+    test_grabbed_ball_strikes();
+    test_fast_ball_collision();
+    test_add_remove_balls();
+    test_targeted_ball_actions();
     test_cli_rejects_bad_input();
     test_keyboard_leave_clears_keys();
     test_regen_shutdown_joins_workers();

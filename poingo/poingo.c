@@ -83,7 +83,7 @@ static void poingo_thread_wait(pthread_t *t, int *status) {
     free(t);
 }
 
-#define POINGO_MENU_ITEMS 8
+#define POINGO_MENU_ITEMS 10
 #define POINGO_MENU_DISC 36
 enum {
     POINGO_MENU_LIGHT = 1,
@@ -91,9 +91,11 @@ enum {
     POINGO_MENU_NOSTALGIA = 3,
     POINGO_MENU_POINGO = 4,
     POINGO_MENU_NEWCOLOR = 5,
-    POINGO_MENU_MUTE = 6,
-    POINGO_MENU_GHOST = 7,
-    POINGO_MENU_QUIT = 8,
+    POINGO_MENU_ADD_BALL = 6,
+    POINGO_MENU_REMOVE_BALL = 7,
+    POINGO_MENU_MUTE = 8,
+    POINGO_MENU_GHOST = 9,
+    POINGO_MENU_QUIT = 10,
 };
 static RingMenu *g_menu = NULL;
 static uint32_t *g_menu_scratch = NULL;
@@ -174,6 +176,7 @@ static bool g_ring_pointer_left_pending = false;
 #define MAX_WALL_PASSES_PER_STEP 8
 #define CANVAS_WIDTH 480.0f
 #define CANVAS_HEIGHT 270.0f
+#define BALL_BASE_DIAMETER 124.0f
 #define FLOOR_Y_NORMALIZED 0.9f
 #define TARGET_PEAK_Y 0.1f
 
@@ -228,6 +231,8 @@ static int g_ball_h = 512;
 #define VOLUME_HUD_HOLD_TIME 1.5f
 
 #define MIN_BOUNCE_SOUND_SPEED_RATIO 0.4f
+#define TING_SOUND_SCALE 0.05f
+#define TING_VOLUME_SCALE 0.42f
 #define POINGO_EXIT_FADE_SECONDS 0.5f
 #define AUDIO_PREDICT_SECONDS 2.0f
 #define AUDIO_PREDICT_DELAY_SECONDS 0.015f
@@ -261,6 +266,37 @@ static float g_target_peak_y = TARGET_PEAK_Y;
 #define FREEDOM_BALL_SCALE_MIN 0.25f
 #define FREEDOM_BALL_SCALE_MAX 1.5f
 #define FREEDOM_BALL_SCALE_STEP 0.05f
+#define POINGO_MAX_BALLS 6
+#define POINGO_SPAWN_ATTEMPTS 256
+#define POINGO_SPAWN_GAP 4.0f
+#define POINGO_COLLISION_RESTITUTION 0.94f
+#define POINGO_COLLISION_TRAVEL_FRACTION 0.25f
+#define POINGO_COLLISION_MAX_STEPS 1024
+
+typedef enum {
+    BALL_MODE_POINGO = 0,
+    BALL_MODE_NOSTALGIA = 1,
+    BALL_MODE_COUNT = 2,
+} BallMode;
+
+typedef enum {
+    BALL_SOUND_SILENT = 0,
+    BALL_SOUND_PLAY = 1,
+} BallSound;
+
+typedef struct {
+    float x;
+    float y;
+    float vx;
+    float vy;
+    int vx_direction;
+    float scale;
+    float diameter;
+    float diameter_norm;
+    uint8_t light_rgb[3];
+    uint8_t dark_rgb[3];
+    BallMode mode;
+} PoingoBall;
 
 static uint8_t g_color_light_rgb[3] = { COLOR_LIGHT_R, COLOR_LIGHT_G, COLOR_LIGHT_B };
 static uint8_t g_color_dark_rgb[3] = { COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B };
@@ -859,17 +895,21 @@ typedef enum {
     BOUNCE_SOUND_NOSTALGIA = 1
 } BounceSoundStyle;
 
-static BounceSoundStyle g_bounce_sound_style = BOUNCE_SOUND_POINGO;
-
-static ToyBounceStyle toy_style(void) {
-    return g_bounce_sound_style == BOUNCE_SOUND_NOSTALGIA
+static ToyBounceStyle toy_style(BounceSoundStyle style) {
+    return style == BOUNCE_SOUND_NOSTALGIA
                ? TOY_BOUNCE_NOSTALGIA : TOY_BOUNCE_POINGO;
 }
 
 typedef struct {
-    ToySamplePair bounce;
+    ToySamplePair pair;
     float pending_size_scale;
     float current_size_scale;
+    BounceSoundStyle style;
+} BallAudio;
+
+typedef struct {
+    BallAudio balls[POINGO_MAX_BALLS];
+    ToySamplePair ting;
 } AudioState;
 
 static ToyMixer g_mixer;
@@ -890,10 +930,13 @@ typedef struct {
 
 
 AudioState audio_state = {
-    .bounce = { NULL, NULL, 0, true },
-    .pending_size_scale = 1.0f,
-    .current_size_scale = 1.0f,
+    .ting = { NULL, NULL, 0, true },
 };
+static int g_bounce_slot = 0;
+
+static BallAudio *current_ball_audio(void) {
+    return &audio_state.balls[g_bounce_slot];
+}
 
 static bool audio_device_open = false;
 
@@ -903,11 +946,14 @@ static void audio_unlock(void) { pthread_mutex_unlock(&g_audio_lock); }
 
 static void update_bounce_sound_style_for_mode(void) {
     BounceSoundStyle target_style = g_a_mode ? BOUNCE_SOUND_NOSTALGIA : BOUNCE_SOUND_POINGO;
-    if (g_bounce_sound_style == target_style) {
+    BallAudio *audio = current_ball_audio();
+    if (audio->style == target_style) {
         return;
     }
-    g_bounce_sound_style = target_style;
-    float size_scale = audio_state.bounce.dirty ? audio_state.pending_size_scale : audio_state.current_size_scale;
+    audio->style = target_style;
+    float size_scale = audio->pair.dirty
+                           ? audio->pending_size_scale
+                           : audio->current_size_scale;
     mark_sounds_dirty(fmaxf(size_scale, 0.01f));
 }
 
@@ -997,11 +1043,16 @@ static void shutdown_audio(void) {
     g_audio_stream = NULL;
     audio_device_open = false;
 
-    toy_sample_pair_free(&audio_state.bounce);
+    for (int i = 0; i < POINGO_MAX_BALLS; i++) {
+        toy_sample_pair_free(&audio_state.balls[i].pair);
+        audio_state.balls[i].pending_size_scale = 1.0f;
+        audio_state.balls[i].current_size_scale = 1.0f;
+        audio_state.balls[i].style = BOUNCE_SOUND_POINGO;
+    }
+    toy_sample_pair_free(&audio_state.ting);
     toy_mixer_reset(&g_mixer);
     toy_audio_release_scratch();
-    audio_state.pending_size_scale = 1.0f;
-    audio_state.current_size_scale = 1.0f;
+    g_bounce_slot = 0;
     g_volume_muted = false;
     g_volume_hud_alpha = 0.0f;
     g_volume_hud_time = 0.0f;
@@ -1012,18 +1063,32 @@ static bool init_audio(bool start_muted) {
     toy_mixer_init(&g_mixer, TOY_AUDIO_DEFAULT_VOLUME);
     audio_device_open = true;
 
-    if (!toy_sample_pair_alloc(&audio_state.bounce,
-                               toy_audio_bounce_pair_length())) {
+    int effect_length = toy_audio_bounce_pair_length();
+    bool samples_ready = toy_sample_pair_alloc(&audio_state.ting,
+                                                effect_length);
+    for (int i = 0; samples_ready && i < POINGO_MAX_BALLS; i++) {
+        BallAudio *audio = &audio_state.balls[i];
+        samples_ready = toy_sample_pair_alloc(&audio->pair, effect_length);
+        audio->pending_size_scale = 1.0f;
+        audio->current_size_scale = 1.0f;
+        audio->style = BOUNCE_SOUND_POINGO;
+        audio->pair.dirty = true;
+    }
+    if (!samples_ready) {
         fprintf(stderr, "Failed to allocate audio sample buffers\n");
         shutdown_audio();
         return false;
     }
-    if (!toy_mixer_reserve(&g_mixer, audio_state.bounce.length) ||
-        !toy_audio_reserve_scratch(audio_state.bounce.length)) {
+    int bounce_length = audio_state.balls[0].pair.length;
+    if (!toy_mixer_reserve(&g_mixer, bounce_length) ||
+        !toy_audio_reserve_scratch(bounce_length)) {
         fprintf(stderr, "Failed to allocate audio mixer workspace\n");
         shutdown_audio();
         return false;
     }
+
+    toy_audio_generate_bounce_pair(&audio_state.ting, TING_SOUND_SCALE,
+                                   TOY_BOUNCE_POINGO);
 
     if (start_muted) {
         g_mixer.muted = true;
@@ -1049,59 +1114,59 @@ static bool init_audio(bool start_muted) {
     return true;
 }
 
-static bool play_bounce_sound(int volume, float pan) {
-    float size_scale = fmaxf(audio_state.current_size_scale, 0.05f);
-
-    if (audio_state.bounce.dirty) {
-        size_scale = fmaxf(audio_state.pending_size_scale, 0.05f);
-        toy_audio_generate_bounce_pair(&audio_state.bounce, size_scale,
-                                       toy_style());
-        audio_state.current_size_scale = size_scale;
+static bool play_pair(const ToySamplePair *pair, float gain, float pan) {
+    if (!pair) {
+        return false;
     }
 
-    float size_factor = 0.7f + 0.3f * fminf(size_scale, 1.0f);
-
-    float velocity_factor = fminf(volume / 32.0f, 1.0f);
-    velocity_factor = fmaxf(velocity_factor, 0.6f);  
-    if (g_ghost_mute) velocity_factor *= 0.05f;
-
-    if (pan < 0.0f) pan = 0.0f;
-    if (pan > 1.0f) pan = 1.0f;
-    /*
-     * Keep the center fixed while making impacts track screen position more
-     * decisively.  The previous normal-mode mapping compressed the entire
-     * field into 8%..92%, which made rapid left/right impacts sound centered.
-     */
-    float pan_shaped = 0.5f + (pan - 0.5f) * 1.15f;
-    if (pan_shaped < 0.0f) pan_shaped = 0.0f;
-    if (pan_shaped > 1.0f) pan_shaped = 1.0f;
+    if (g_ghost_mute) {
+        gain *= 0.05f;
+    }
+    float pan_shaped = 0.5f + (clampf(pan, 0.0f, 1.0f) - 0.5f) * 1.15f;
+    pan_shaped = clampf(pan_shaped, 0.0f, 1.0f);
     float l_gain, r_gain;
     toy_audio_equal_power_pan(pan_shaped, &l_gain, &r_gain);
 
-    /*
-     * Reserve ownership under the mixer lock, copy into the preallocated
-     * snapshot without that lock, then publish the completed voice quickly.
-     */
     ToyVoiceClaim claim;
     audio_lock();
-    bool claimed = toy_mixer_claim_voice(
-        &g_mixer, audio_state.bounce.length, &claim);
+    bool claimed = toy_mixer_claim_voice(&g_mixer, pair->length, &claim);
     audio_unlock();
-    if (!claimed) return false;
+    if (!claimed) {
+        return false;
+    }
 
-    bool copied = toy_mixer_copy_claimed_voice(
-        &g_mixer, claim, &audio_state.bounce);
+    bool copied = toy_mixer_copy_claimed_voice(&g_mixer, claim, pair);
     audio_lock();
-    bool committed =
-        copied &&
-        toy_mixer_commit_voice(
-            &g_mixer, claim, audio_state.bounce.length,
-            size_factor * velocity_factor, l_gain, r_gain);
+    bool committed = copied && toy_mixer_commit_voice(
+        &g_mixer, claim, pair->length, gain, l_gain, r_gain);
     if (!committed) {
         toy_mixer_cancel_voice(&g_mixer, claim);
     }
     audio_unlock();
     return committed;
+}
+
+static bool play_bounce_sound(int volume, float pan) {
+    BallAudio *audio = current_ball_audio();
+    float size_scale = fmaxf(audio->current_size_scale, 0.05f);
+
+    if (audio->pair.dirty) {
+        size_scale = fmaxf(audio->pending_size_scale, 0.05f);
+        toy_audio_generate_bounce_pair(&audio->pair, size_scale,
+                                       toy_style(audio->style));
+        audio->current_size_scale = size_scale;
+    }
+
+    float size_factor = 0.7f + 0.3f * fminf(size_scale, 1.0f);
+
+    float velocity_factor = fminf(volume / 32.0f, 1.0f);
+    velocity_factor = fmaxf(velocity_factor, 0.6f);
+    return play_pair(&audio->pair, size_factor * velocity_factor, pan);
+}
+
+static void play_ting_sound(float impact_ratio, float pan) {
+    float gain = TING_VOLUME_SCALE * clampf(impact_ratio, 0.25f, 1.5f);
+    (void)play_pair(&audio_state.ting, gain, pan);
 }
 
 static void adjust_master_volume(float delta) {
@@ -1407,8 +1472,6 @@ static float measure_text(const char *text, float scale) {
 
 
 
-static bool is_mouse_over_ball(int mouse_x, int mouse_y, float ball_x, float ball_y,
-                                int window_w, int window_h);
 
 
 
@@ -1430,29 +1493,9 @@ static float remap_normalized_scale_to_sound(float normalized_scale) {
 }
 
 static void mark_sounds_dirty(float size_scale) {
-    audio_state.bounce.dirty = true;
-    audio_state.pending_size_scale = fmaxf(size_scale, 0.01f);
-}
-
-static bool is_mouse_over_ball(int mouse_x, int mouse_y, float ball_x, float ball_y,
-                                int window_w, int window_h) {
-    float prop_x = window_w / CANVAS_WIDTH;
-    float prop_y = window_h / CANVAS_HEIGHT;
-    float total_prop = fminf(prop_x, prop_y);
-    float ball_diameter = 124.0f * total_prop;
-    ball_diameter *= g_freerange_ball_scale;
-
-    float ball_y_pixels = ball_y * window_h;
-
-    float ball_center_x = ball_x + ball_diameter / 2.0f;
-    float ball_center_y = ball_y_pixels + ball_diameter / 2.0f;
-    float ball_radius = ball_diameter / 2.0f;
-
-    float dx = mouse_x - ball_center_x;
-    float dy = mouse_y - ball_center_y;
-    float distance = sqrtf(dx * dx + dy * dy);
-
-    return distance <= ball_radius;
+    BallAudio *audio = current_ball_audio();
+    audio->pair.dirty = true;
+    audio->pending_size_scale = fmaxf(size_scale, 0.01f);
 }
 
 static void calculate_equilibrium_state(int window_w, int window_h,
@@ -1463,7 +1506,7 @@ static void calculate_equilibrium_state(int window_w, int window_h,
     float prop_x = window_w / CANVAS_WIDTH;
     float prop_y = window_h / CANVAS_HEIGHT;
     float total_prop = fminf(prop_x, prop_y);
-    float ball_diameter = 124.0f * total_prop;
+    float ball_diameter = BALL_BASE_DIAMETER * total_prop;
     ball_diameter *= g_freerange_ball_scale;
     float ball_diameter_normalized = ball_diameter / (float)window_h;
 
@@ -1915,8 +1958,6 @@ static void update_ball_physics(float *ball_x, float *ball_y,
 }
 
 
-static bool is_mouse_over_ball(int mouse_x, int mouse_y, float ball_x, float ball_y,
-                                int window_w, int window_h);
 
 
 
@@ -1967,8 +2008,14 @@ static const char *freerange_frag_shader_text =
     "varying vec2 uv;\n"
     "uniform sampler2D tex;\n"
     "uniform float alpha;\n"
+    "uniform float recolor;\n"
+    "uniform vec3 light_color;\n"
+    "uniform vec3 dark_color;\n"
     "void main() {\n"
-    "    gl_FragColor = texture2D(tex, uv) * alpha;\n"
+    "    vec4 source = texture2D(tex, uv);\n"
+    "    vec3 mapped = source.r * light_color + source.g * dark_color;\n"
+    "    vec3 color = mix(source.rgb, mapped, recolor);\n"
+    "    gl_FragColor = vec4(color, source.a) * alpha;\n"
     "}\n";
 
 /* The HUD, the ring menu and the Ghost badge background all carry straight
@@ -2033,6 +2080,9 @@ typedef struct {
     GLint gl_uv_loc;
     GLint gl_tex_loc;
     GLint gl_alpha_loc;
+    GLint gl_recolor_loc;
+    GLint gl_light_loc;
+    GLint gl_dark_loc;
     GLuint *gl_textures;
     int gl_texture_count;
     bool gl_ready;
@@ -2064,7 +2114,8 @@ typedef struct {
     bool key_speed_up_pressed;
     bool key_speed_down_pressed;
 
-    bool ball_grabbed;
+    int grabbed_ball;
+    int menu_ball;
     float grab_u;
     float grab_v;
     float slingshot_pull_x;
@@ -2112,13 +2163,8 @@ typedef struct {
     } mouse_history[FREEDOM_MOUSE_HISTORY_SIZE];
     int mouse_history_index;
 
-    float ball_x;
-    float ball_y;
-    float ball_vx;
-    float ball_vy;
-    int ball_vx_direction;
-    float ball_diameter;
-    float ball_diameter_norm;
+    PoingoBall balls[POINGO_MAX_BALLS];
+    int ball_count;
 
     float phase_f;
     int phase_i;
@@ -2126,7 +2172,6 @@ typedef struct {
     uint64_t last_counter;
     uint64_t performance_frequency;
     bool make_noise;
-    float last_total_prop;
 
 } FreedomState;
 
@@ -2267,7 +2312,7 @@ static bool freerange_color_regen_prepare_assets(FreedomState *st, const Freedom
     if (!st->color_regen_shadow_pixels) {
         const int sphere_texture_size = BALL_W;
         const float canonical_total_prop = 1.0f;
-        const float canonical_ball_diameter = 124.0f * canonical_total_prop;
+        const float canonical_ball_diameter = BALL_BASE_DIAMETER * canonical_total_prop;
         const float canonical_ball_radius = canonical_ball_diameter * 0.5f;
         const float shadow_offset_x_screen = canonical_total_prop * 8.0f * 0.6f;
         const float shadow_offset_y_screen = canonical_total_prop * 8.0f * 1.0f;
@@ -2351,7 +2396,7 @@ static void freerange_regen_update_scanline(uint8_t * restrict dst_frame,
 }
 
 
-static bool freerange_regen_workspace_prepare(FreedomState *st,
+static bool __attribute__((unused)) freerange_regen_workspace_prepare(FreedomState *st,
                                                const FreedomFrameSet *frames) {
     if (!st || !frames || frames->frame_count <= 0 || frames->frame_h <= 0) return false;
     if (st->regen_workspace_units > 0) return true;
@@ -2830,7 +2875,7 @@ typedef enum {
  *
  * A NULL light_rgb means "pick a fresh colour" rather than "set this one".
  */
-static void freerange_regen_transition(FreedomState *st, PoingoModeChange mode,
+static void __attribute__((unused)) freerange_regen_transition(FreedomState *st, PoingoModeChange mode,
                                        const uint8_t light_rgb[3],
                                        const uint8_t dark_rgb[3]) {
     if (!st || !st->frames_ref) {
@@ -2898,6 +2943,348 @@ static void freerange_request_graceful_shutdown(FreedomState *st) {
     st->exit_fade = POINGO_EXIT_FADE_SECONDS;
     st->shutdown_start_ticks = poingo_ticks_ms();
     audio_begin_shutdown_fade(POINGO_EXIT_FADE_SECONDS);
+}
+
+static void ball_size(PoingoBall *ball, int width, int height) {
+    if (!ball || width <= 0 || height <= 0) {
+        return;
+    }
+
+    float prop_x = (float)width / CANVAS_WIDTH;
+    float prop_y = (float)height / CANVAS_HEIGHT;
+    ball->diameter = BALL_BASE_DIAMETER * fminf(prop_x, prop_y) * ball->scale;
+    ball->diameter_norm = ball->diameter / (float)height;
+}
+
+static int ball_at(const FreedomState *st, int x, int y) {
+    if (!st || st->ghost_mode) {
+        return -1;
+    }
+
+    for (int i = st->ball_count - 1; i >= 0; i--) {
+        const PoingoBall *ball = &st->balls[i];
+        float cx = ball->x + ball->diameter * 0.5f;
+        float cy = ball->y * (float)st->height + ball->diameter * 0.5f;
+        float dx = (float)x - cx;
+        float dy = (float)y - cy;
+        float radius = ball->diameter * 0.5f;
+        if (dx * dx + dy * dy <= radius * radius) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void ball_velocity(const PoingoBall *ball, int height,
+                          float *vx, float *vy) {
+    *vx = ball->vx * (float)ball->vx_direction;
+    *vy = ball->vy * (float)height;
+}
+
+static void ball_set_velocity(PoingoBall *ball, int height,
+                              float vx, float vy) {
+    ball->vx_direction = vx < 0.0f ? -1 : 1;
+    ball->vx = fabsf(vx);
+    ball->vy = vy / (float)height;
+}
+
+static void ball_sound(const PoingoBall *ball, int index) {
+    g_bounce_slot = index;
+    BallAudio *audio = current_ball_audio();
+    BounceSoundStyle style = ball->mode == BALL_MODE_NOSTALGIA
+                                 ? BOUNCE_SOUND_NOSTALGIA
+                                 : BOUNCE_SOUND_POINGO;
+    float size_scale = remap_normalized_scale_to_sound(
+        ball->diameter / BALL_BASE_DIAMETER);
+    float selected_scale = audio->pair.dirty
+                               ? audio->pending_size_scale
+                               : audio->current_size_scale;
+    if (audio->style == style &&
+        fabsf(selected_scale - size_scale) <= 0.001f) {
+        return;
+    }
+
+    audio->style = style;
+    mark_sounds_dirty(size_scale);
+}
+
+static void solve_ball_pair(FreedomState *st, int a_index, int b_index,
+                            BallSound sound) {
+    PoingoBall *a = &st->balls[a_index];
+    PoingoBall *b = &st->balls[b_index];
+    float ax = a->x + a->diameter * 0.5f;
+    float ay = a->y * (float)st->height + a->diameter * 0.5f;
+    float bx = b->x + b->diameter * 0.5f;
+    float by = b->y * (float)st->height + b->diameter * 0.5f;
+    float dx = bx - ax;
+    float dy = by - ay;
+    float radius_sum = (a->diameter + b->diameter) * 0.5f;
+    float distance_sq = dx * dx + dy * dy;
+    if (distance_sq >= radius_sum * radius_sum) {
+        return;
+    }
+
+    float distance = sqrtf(distance_sq);
+    float nx = distance > 0.001f ? dx / distance : 1.0f;
+    float ny = distance > 0.001f ? dy / distance : 0.0f;
+    float avx, avy, bvx, bvy;
+    ball_velocity(a, st->height, &avx, &avy);
+    ball_velocity(b, st->height, &bvx, &bvy);
+    float approach_speed = -((bvx - avx) * nx + (bvy - avy) * ny);
+    float inv_a = a_index == st->grabbed_ball
+                      ? 0.0f : 1.0f / (a->diameter * a->diameter);
+    float inv_b = b_index == st->grabbed_ball
+                      ? 0.0f : 1.0f / (b->diameter * b->diameter);
+    float inv_sum = inv_a + inv_b;
+    if (inv_sum <= 0.0f) {
+        return;
+    }
+
+    if (approach_speed > 0.0f) {
+        float impulse = (1.0f + POINGO_COLLISION_RESTITUTION) *
+                        approach_speed / inv_sum;
+        avx -= impulse * inv_a * nx;
+        avy -= impulse * inv_a * ny;
+        bvx += impulse * inv_b * nx;
+        bvy += impulse * inv_b * ny;
+        if (inv_a > 0.0f) {
+            ball_set_velocity(a, st->height, avx, avy);
+        }
+        if (inv_b > 0.0f) {
+            ball_set_velocity(b, st->height, bvx, bvy);
+        }
+
+        float baseline = get_natural_vx(st->width);
+        if (sound == BALL_SOUND_PLAY &&
+            impact_speed_is_audible(approach_speed, baseline)) {
+            float pan = ((ax + bx) * 0.5f) / (float)st->width;
+            play_ting_sound(approach_speed / baseline, pan);
+        }
+    }
+
+    /* Separate overlap in inverse-mass proportion so unequal hollow shells
+     * do not gain energy from positional correction. */
+    float correction = (radius_sum - distance) / inv_sum;
+    a->x -= correction * inv_a * nx;
+    a->y -= correction * inv_a * ny / (float)st->height;
+    b->x += correction * inv_b * nx;
+    b->y += correction * inv_b * ny / (float)st->height;
+    a->x = clampf(a->x, 0.0f, (float)st->width - a->diameter);
+    b->x = clampf(b->x, 0.0f, (float)st->width - b->diameter);
+    a->y = clampf(a->y, 0.0f, g_floor_y_normalized - a->diameter_norm);
+    b->y = clampf(b->y, 0.0f, g_floor_y_normalized - b->diameter_norm);
+}
+
+static void sweep_grabbed_ball(FreedomState *st, float old_x, float old_y,
+                               float new_x, float new_y) {
+    if (!st || st->grabbed_ball < 0 ||
+        st->grabbed_ball >= st->ball_count) {
+        return;
+    }
+
+    PoingoBall *grabbed = &st->balls[st->grabbed_ball];
+    float dx = new_x - old_x;
+    float dy = (new_y - old_y) * (float)st->height;
+    float step_travel = grabbed->diameter *
+                        POINGO_COLLISION_TRAVEL_FRACTION;
+    int steps = step_travel > 0.0f
+                    ? (int)ceilf(sqrtf(dx * dx + dy * dy) / step_travel)
+                    : 1;
+    steps = steps < 1 ? 1 : steps;
+    steps = steps > POINGO_COLLISION_MAX_STEPS
+                ? POINGO_COLLISION_MAX_STEPS : steps;
+
+    for (int step = 1; step <= steps; step++) {
+        float progress = (float)step / (float)steps;
+        grabbed->x = old_x + (new_x - old_x) * progress;
+        grabbed->y = old_y + (new_y - old_y) * progress;
+        for (int i = 0; i < st->ball_count; i++) {
+            if (i == st->grabbed_ball) {
+                continue;
+            }
+            int a = i < st->grabbed_ball ? i : st->grabbed_ball;
+            int b = i < st->grabbed_ball ? st->grabbed_ball : i;
+            solve_ball_pair(st, a, b,
+                            st->make_noise ? BALL_SOUND_PLAY : BALL_SOUND_SILENT);
+        }
+    }
+}
+
+static int ball_substeps(const FreedomState *st, double sim_delta) {
+    float max_velocity = 0.0f;
+    float min_diameter = st->balls[0].diameter;
+    for (int i = 0; i < st->ball_count; i++) {
+        const PoingoBall *ball = &st->balls[i];
+        max_velocity = fmaxf(max_velocity, ball->vx);
+        max_velocity = fmaxf(max_velocity, fabsf(ball->vy) * (float)st->height);
+        min_diameter = fminf(min_diameter, ball->diameter);
+    }
+
+    float travel = max_velocity * (float)(sim_delta * 60.0 *
+                                           g_speed_multiplier);
+    float step_travel = min_diameter * POINGO_COLLISION_TRAVEL_FRACTION;
+    int steps = step_travel > 0.0f ? (int)ceilf(travel / step_travel) : 1;
+    if (steps < 1) {
+        return 1;
+    }
+    if (steps > POINGO_COLLISION_MAX_STEPS) {
+        return POINGO_COLLISION_MAX_STEPS;
+    }
+    return steps;
+}
+
+static void step_balls(FreedomState *st, double sim_delta, BallSound sound) {
+    if (!st || st->ball_count <= 0) {
+        return;
+    }
+
+    int steps = st->ball_count > 1 ? ball_substeps(st, sim_delta) : 1;
+    double step_delta = sim_delta / (double)steps;
+    for (int step = 0; step < steps; step++) {
+        for (int i = 0; i < st->ball_count; i++) {
+            PoingoBall *ball = &st->balls[i];
+            ball_sound(ball, i);
+            update_ball_physics(&ball->x, &ball->y,
+                                &ball->vx, &ball->vy,
+                                &ball->vx_direction,
+                                st->width, 0.0f, 0.0f,
+                                ball->diameter, ball->diameter_norm,
+                                step_delta, i == st->grabbed_ball,
+                                sound == BALL_SOUND_PLAY,
+                                g_actual_bounce_serial,
+                                NULL, NULL, 0, 0.0f);
+        }
+
+        for (int a = 0; a < st->ball_count; a++) {
+            for (int b = a + 1; b < st->ball_count; b++) {
+                solve_ball_pair(st, a, b, sound);
+            }
+        }
+    }
+}
+
+static float random_unit(void) {
+    return (float)random() / (float)RAND_MAX;
+}
+
+static void random_ball_palette(PoingoBall *ball) {
+    uint8_t saved_light[3];
+    uint8_t saved_dark[3];
+    memcpy(saved_light, g_color_light_rgb, sizeof(saved_light));
+    memcpy(saved_dark, g_color_dark_rgb, sizeof(saved_dark));
+    memcpy(g_color_light_rgb, ball->light_rgb, sizeof(g_color_light_rgb));
+    memcpy(g_color_dark_rgb, ball->dark_rgb, sizeof(g_color_dark_rgb));
+    pick_palette_colors(0.75f + random_unit() * 0.25f,
+                        ball->light_rgb, ball->dark_rgb, false);
+    memcpy(g_color_light_rgb, saved_light, sizeof(g_color_light_rgb));
+    memcpy(g_color_dark_rgb, saved_dark, sizeof(g_color_dark_rgb));
+}
+
+static void set_ball_mode(PoingoBall *ball, BallMode mode) {
+    if (!ball) {
+        return;
+    }
+
+    static const uint8_t poingo_light[3] = {
+        COLOR_LIGHT_R, COLOR_LIGHT_G, COLOR_LIGHT_B
+    };
+    static const uint8_t poingo_dark[3] = {
+        COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B
+    };
+    static const uint8_t nostalgia_light[3] = {255, 255, 255};
+    static const uint8_t nostalgia_dark[3] = {255, 0, 0};
+    const uint8_t *light = mode == BALL_MODE_NOSTALGIA
+                               ? nostalgia_light : poingo_light;
+    const uint8_t *dark = mode == BALL_MODE_NOSTALGIA
+                              ? nostalgia_dark : poingo_dark;
+    memcpy(ball->light_rgb, light, 3);
+    memcpy(ball->dark_rgb, dark, 3);
+    ball->mode = mode;
+}
+
+static bool ball_fits(const FreedomState *st, const PoingoBall *candidate) {
+    float cx = candidate->x + candidate->diameter * 0.5f;
+    float cy = candidate->y * (float)st->height + candidate->diameter * 0.5f;
+    for (int i = 0; i < st->ball_count; i++) {
+        const PoingoBall *ball = &st->balls[i];
+        float bx = ball->x + ball->diameter * 0.5f;
+        float by = ball->y * (float)st->height + ball->diameter * 0.5f;
+        float dx = bx - cx;
+        float dy = by - cy;
+        float gap = (ball->diameter + candidate->diameter) * 0.5f +
+                    POINGO_SPAWN_GAP;
+        if (dx * dx + dy * dy < gap * gap) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool add_ball(FreedomState *st) {
+    if (!st || st->ball_count >= POINGO_MAX_BALLS ||
+        st->width <= 0 || st->height <= 0) {
+        return false;
+    }
+
+    PoingoBall ball = {
+        .vx_direction = 1,
+        .scale = 1.0f,
+        .light_rgb = {COLOR_LIGHT_R, COLOR_LIGHT_G, COLOR_LIGHT_B},
+        .dark_rgb = {COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B},
+        .mode = BALL_MODE_POINGO,
+    };
+    for (int attempt = 0; attempt < POINGO_SPAWN_ATTEMPTS; attempt++) {
+        float room_bias = 1.0f - (float)attempt /
+                          (float)POINGO_SPAWN_ATTEMPTS;
+        ball.scale = FREEDOM_BALL_SCALE_MIN + random_unit() * room_bias *
+                     (FREEDOM_BALL_SCALE_MAX - FREEDOM_BALL_SCALE_MIN);
+        ball_size(&ball, st->width, st->height);
+        float max_x = (float)st->width - ball.diameter;
+        float max_y = g_floor_y_normalized - ball.diameter_norm;
+        if (max_x < 0.0f || max_y < 0.0f) {
+            continue;
+        }
+        ball.x = random_unit() * max_x;
+        ball.y = random_unit() * max_y;
+        if (!ball_fits(st, &ball)) {
+            continue;
+        }
+
+        float natural_vx = get_natural_vx(st->width);
+        float ideal_vy = get_ideal_bounce_vy(ball.diameter_norm, GRAVITY);
+        ball.vx = natural_vx * (0.5f + random_unit() * 2.5f);
+        ball.vx_direction = random() & 1 ? 1 : -1;
+        ball.vy = ideal_vy * (random_unit() * 2.0f - 1.0f);
+        random_ball_palette(&ball);
+        st->balls[st->ball_count++] = ball;
+        audio_predict_reset(g_audio_sim_time);
+        return true;
+    }
+    return false;
+}
+
+static void remove_ball(FreedomState *st, int index) {
+    if (!st || index < 0 || index >= st->ball_count) {
+        return;
+    }
+    if (st->ball_count == 1) {
+        freerange_request_graceful_shutdown(st);
+        return;
+    }
+
+    if (index + 1 < st->ball_count) {
+        memmove(&st->balls[index], &st->balls[index + 1],
+                (size_t)(st->ball_count - index - 1) * sizeof(st->balls[0]));
+    }
+    st->ball_count--;
+    if (st->grabbed_ball == index) {
+        st->grabbed_ball = -1;
+        st->pointer_down = false;
+    } else if (st->grabbed_ball > index) {
+        st->grabbed_ball--;
+    }
+    st->menu_ball = -1;
+    audio_predict_reset(g_audio_sim_time);
 }
 
 
@@ -2998,13 +3385,18 @@ static bool freerange_gl_init(FreedomState *st, const FreedomFrameSet *frames) {
     /* alpha carries the startup beam and the exit fade, so a missing location
        is as fatal as a missing texture sampler. */
     st->gl_alpha_loc = glGetUniformLocation(st->gl_program, "alpha");
+    st->gl_recolor_loc = glGetUniformLocation(st->gl_program, "recolor");
+    st->gl_light_loc = glGetUniformLocation(st->gl_program, "light_color");
+    st->gl_dark_loc = glGetUniformLocation(st->gl_program, "dark_color");
     if (st->gl_pos_loc < 0 || st->gl_uv_loc < 0 || st->gl_tex_loc < 0 ||
-        st->gl_alpha_loc < 0) {
+        st->gl_alpha_loc < 0 || st->gl_recolor_loc < 0 ||
+        st->gl_light_loc < 0 || st->gl_dark_loc < 0) {
         fprintf(stderr, "GL program is missing an expected attribute or uniform\n");
         return false;
     }
 
     glUniform1i(st->gl_tex_loc, 0);
+    glUniform1f(st->gl_recolor_loc, 0.0f);
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     freerange_gl_blend_straight();
@@ -3092,26 +3484,27 @@ static void freerange_rect_clamp(FreerangeRect *r, int width, int height) {
     if (r->h < 0) r->h = 0;
 }
 
-static bool freerange_ball_dest_quad(const FreedomState *st, const FreedomFrameSet *frames,
+static bool freerange_ball_dest_quad(const FreedomState *st, const PoingoBall *ball,
+                                     const FreedomFrameSet *frames,
                                      float extrap_dt,
                                      float *out_x, float *out_y, float *out_w, float *out_h) {
-    if (!st || !frames || frames->frame_count <= 0 ||
+    if (!st || !ball || !frames || frames->frame_count <= 0 ||
         st->width <= 0 || st->height <= 0) {
         return false;
     }
 
     float exscale = extrap_dt * 60.0f * g_speed_multiplier;
-    float rx = st->ball_x + (st->ball_vx * (float)st->ball_vx_direction) * exscale;
-    float ry = st->ball_y + st->ball_vy * exscale;
-    float rx_max = (float)st->width - st->ball_diameter;
-    float ry_max = 1.0f - st->ball_diameter_norm;
+    float rx = ball->x + (ball->vx * (float)ball->vx_direction) * exscale;
+    float ry = ball->y + ball->vy * exscale;
+    float rx_max = (float)st->width - ball->diameter;
+    float ry_max = 1.0f - ball->diameter_norm;
     if (rx < 0.0f) rx = 0.0f;
     if (rx > rx_max) rx = rx_max;
     if (ry < 0.0f) ry = 0.0f;
     if (ry > ry_max) ry = ry_max;
 
     float ball_y_pixels = ry * (float)st->height;
-    float composite_scale = st->ball_diameter / (float)BALL_W;
+    float composite_scale = ball->diameter / (float)BALL_W;
     float composite_offset_x = (float)g_ball_texture_offset_x * composite_scale;
     float composite_offset_y = (float)g_ball_texture_offset_y * composite_scale;
 
@@ -3122,18 +3515,20 @@ static bool freerange_ball_dest_quad(const FreedomState *st, const FreedomFrameS
     return true;
 }
 
-static void freerange_gl_draw_frame(FreedomState *st, const FreedomFrameSet *frames, float extrap_dt) {
-    if (!st || !st->gl_ready) {
+static void freerange_gl_draw_ball(FreedomState *st, const PoingoBall *ball,
+                                   const FreedomFrameSet *frames, float extrap_dt) {
+    if (!st || !ball || !st->gl_ready) {
         return;
     }
 
     float dest_x, dest_y, composite_w, composite_h;
-    if (!freerange_ball_dest_quad(st, frames, extrap_dt,
+    if (!freerange_ball_dest_quad(st, ball, frames, extrap_dt,
                                   &dest_x, &dest_y, &composite_w, &composite_h)) {
         return;
     }
 
-    int frame_index = st->phase_i;
+    int mode_frame_count = frames->frame_count / BALL_MODE_COUNT;
+    int frame_index = (int)ball->mode * mode_frame_count + st->phase_i;
     if (frame_index < 0 || frame_index >= frames->frame_count) {
         return;
     }
@@ -3153,6 +3548,15 @@ static void freerange_gl_draw_frame(FreedomState *st, const FreedomFrameSet *fra
     glUseProgram(st->gl_program);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, st->gl_textures[frame_index]);
+    glUniform1f(st->gl_recolor_loc, 1.0f);
+    glUniform3f(st->gl_light_loc,
+                ball->light_rgb[0] / 255.0f,
+                ball->light_rgb[1] / 255.0f,
+                ball->light_rgb[2] / 255.0f);
+    glUniform3f(st->gl_dark_loc,
+                ball->dark_rgb[0] / 255.0f,
+                ball->dark_rgb[1] / 255.0f,
+                ball->dark_rgb[2] / 255.0f);
     glVertexAttribPointer(st->gl_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
     glVertexAttribPointer(st->gl_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts + 2);
     glEnableVertexAttribArray(st->gl_pos_loc);
@@ -3183,6 +3587,24 @@ static void freerange_gl_draw_frame(FreedomState *st, const FreedomFrameSet *fra
     freerange_gl_blend_premul();
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     freerange_gl_blend_straight();
+}
+
+static void freerange_gl_draw_frame(FreedomState *st, const FreedomFrameSet *frames,
+                                    float extrap_dt) {
+    if (!st) {
+        return;
+    }
+
+    for (int i = 0; i < st->ball_count; i++) {
+        if (i == st->grabbed_ball) {
+            continue;
+        }
+        freerange_gl_draw_ball(st, &st->balls[i], frames, extrap_dt);
+    }
+    if (st->grabbed_ball >= 0 && st->grabbed_ball < st->ball_count) {
+        freerange_gl_draw_ball(st, &st->balls[st->grabbed_ball], frames,
+                               extrap_dt);
+    }
 }
 
 static void hud_blend_pixel(uint8_t *dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -3456,6 +3878,7 @@ static void freerange_gl_draw_hud(FreedomState *st) {
     };
 
     glUseProgram(st->gl_program);
+    glUniform1f(st->gl_recolor_loc, 0.0f);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, st->gl_hud_texture);
     glVertexAttribPointer(st->gl_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
@@ -3512,59 +3935,63 @@ static bool freerange_pump_events(struct wl_display *display, int timeout_ms) {
     return wl_display_dispatch_pending(display) >= 0;
 }
 
-static void freerange_update_input_region(struct wl_compositor *compositor,
-                                        struct wl_surface *surface,
-                                        int width, int height,
-                                        float ball_x, float ball_y,
-                                        float ball_diameter, bool ghost_mode) {
-    if (!compositor || !surface || width <= 0 || height <= 0 || ball_diameter <= 0.0f) {
-        return;
-    }
+static void add_ball_region(struct wl_region *region, const PoingoBall *ball,
+                            int width, int height) {
+    float center_x = ball->x + ball->diameter * 0.5f;
+    float center_y = ball->y * (float)height + ball->diameter * 0.5f;
+    float radius = ball->diameter * 0.5f;
+    const int row_step = 2;
+    int y_start = (int)floorf(center_y - radius);
+    int y_end = (int)ceilf(center_y + radius);
+    y_start = y_start < 0 ? 0 : y_start;
+    y_end = y_end > height ? height : y_end;
 
-    struct wl_region *region = wl_compositor_create_region(compositor);
-    if (!region) {
-        return;
-    }
-
-    if (g_menu && ringmenu_is_open(g_menu)) {
-        wl_region_add(region, 0, 0, width, height);
-    } else if (ghost_mode) {
-        wl_region_add(region, width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN, GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE);
-    } else {
-        float ball_center_x = ball_x + ball_diameter * 0.5f;
-        float ball_center_y = (ball_y * (float)height) + ball_diameter * 0.5f;
-    float radius = ball_diameter * 0.5f;
-    int step = 2;
-    int y_start = (int)floorf(ball_center_y - radius);
-    int y_end = (int)ceilf(ball_center_y + radius);
-
-    if (y_start < 0) y_start = 0;
-    if (y_end > height) y_end = height;
-
-    for (int y = y_start; y < y_end; y += step) {
-        float dy = ((float)y + 0.5f) - ball_center_y;
+    for (int y = y_start; y < y_end; y += row_step) {
+        float dy = (float)y + 0.5f - center_y;
         float inside = radius * radius - dy * dy;
         if (inside <= 0.0f) {
             continue;
         }
         float dx = sqrtf(inside);
-        int x = (int)floorf(ball_center_x - dx);
-        int w = (int)ceilf(dx * 2.0f);
-        if (unlikely(x < 0)) {
-            w += x;
+        int x = (int)floorf(center_x - dx);
+        int region_width = (int)ceilf(dx * 2.0f);
+        if (x < 0) {
+            region_width += x;
             x = 0;
         }
-        if (unlikely(x + w > width)) {
-            w = width - x;
+        if (x + region_width > width) {
+            region_width = width - x;
         }
-        if (likely(w > 0)) {
-            int h = step;
-            wl_region_add(region, x, y, w, h);
+        if (region_width > 0) {
+            wl_region_add(region, x, y, region_width, row_step);
         }
+    }
+}
+
+static void freerange_update_input_region(FreedomState *st) {
+    if (!st || !st->compositor || !st->surface ||
+        st->width <= 0 || st->height <= 0) {
+        return;
+    }
+
+    struct wl_region *region = wl_compositor_create_region(st->compositor);
+    if (!region) {
+        return;
+    }
+
+    if (g_menu && ringmenu_is_open(g_menu)) {
+        wl_region_add(region, 0, 0, st->width, st->height);
+    } else if (st->ghost_mode) {
+        wl_region_add(region,
+                      st->width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN,
+                      GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE);
+    } else {
+        for (int i = 0; i < st->ball_count; i++) {
+            add_ball_region(region, &st->balls[i], st->width, st->height);
         }
     }
 
-    wl_surface_set_input_region(surface, region);
+    wl_surface_set_input_region(st->surface, region);
     wl_region_destroy(region);
 }
 
@@ -3579,7 +4006,7 @@ static bool freerange_prepare_frame_geometry(FreerangeFrameGeometry *geometry) {
     compute_axis_vectors();
 
     const int sphere_texture_size = BALL_W;
-    const float canonical_ball_diameter = 124.0f;
+    const float canonical_ball_diameter = BALL_BASE_DIAMETER;
     const float canonical_ball_radius = canonical_ball_diameter * 0.5f;
     const float shadow_offset_x_screen = 8.0f * 0.6f;
     const float shadow_offset_y_screen = 8.0f;
@@ -3714,7 +4141,8 @@ static bool freerange_generate_frames(FreedomFrameSet *out_frames, int frame_cou
     return true;
 }
 
-static bool freerange_prepare_blank_frames(FreedomFrameSet *out_frames, int frame_count) {
+static bool __attribute__((unused)) freerange_prepare_blank_frames(FreedomFrameSet *out_frames,
+        int frame_count) {
     if (!out_frames || frame_count <= 0) {
         return false;
     }
@@ -3751,6 +4179,66 @@ static void freerange_destroy_frames(FreedomFrameSet *frames) {
     frames->frame_count = 0;
     frames->frame_w = 0;
     frames->frame_h = 0;
+}
+
+/* Red and green encode the two checker colors; the shader supplies each
+ * ball's palette without duplicating the animation textures. */
+static bool make_basis_frames(FreedomFrameSet *out_frames, int frame_count,
+                              float angle_period) {
+    uint8_t saved_light[3];
+    uint8_t saved_dark[3];
+    bool saved_mode = g_a_mode;
+    FreedomFrameSet modes[BALL_MODE_COUNT] = {0};
+    bool ok = true;
+
+    memcpy(saved_light, g_color_light_rgb, sizeof(saved_light));
+    memcpy(saved_dark, g_color_dark_rgb, sizeof(saved_dark));
+
+    for (int mode = 0; mode < BALL_MODE_COUNT; mode++) {
+        const uint8_t basis_light[3] = {255, 0, 0};
+        const uint8_t basis_dark[3] = {0, 255, 0};
+        memcpy(g_color_light_rgb, basis_light, sizeof(g_color_light_rgb));
+        memcpy(g_color_dark_rgb, basis_dark, sizeof(g_color_dark_rgb));
+        set_a_mode_enabled(mode == BALL_MODE_NOSTALGIA);
+        invalidate_sphere_pixel_cache();
+
+        if (!freerange_generate_frames(&modes[mode], frame_count,
+                                       angle_period)) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        size_t total_size = modes[0].frame_size * (size_t)frame_count *
+                            BALL_MODE_COUNT;
+        uint8_t *combined = malloc(total_size);
+        if (!combined) {
+            ok = false;
+        } else {
+            for (int mode = 0; mode < BALL_MODE_COUNT; mode++) {
+                memcpy(combined + modes[mode].frame_size *
+                       (size_t)frame_count * (size_t)mode,
+                       modes[mode].frames,
+                       modes[mode].frame_size * (size_t)frame_count);
+            }
+            out_frames->frames = combined;
+            out_frames->frame_size = modes[0].frame_size;
+            out_frames->frame_count = frame_count * BALL_MODE_COUNT;
+            out_frames->frame_w = modes[0].frame_w;
+            out_frames->frame_h = modes[0].frame_h;
+        }
+    }
+
+    for (int mode = 0; mode < BALL_MODE_COUNT; mode++) {
+        freerange_destroy_frames(&modes[mode]);
+    }
+
+    memcpy(g_color_light_rgb, saved_light, sizeof(g_color_light_rgb));
+    memcpy(g_color_dark_rgb, saved_dark, sizeof(g_color_dark_rgb));
+    set_a_mode_enabled(saved_mode);
+    invalidate_sphere_pixel_cache();
+    return ok;
 }
 
 static void freerange_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
@@ -3976,22 +4464,40 @@ static void freerange_pointer_motion(void *data, struct wl_pointer *pointer,
     st->mouse_history[st->mouse_history_index].time = now;
     st->mouse_history_index = (st->mouse_history_index + 1) % FREEDOM_MOUSE_HISTORY_SIZE;
 
-	    if (st->pointer_down && st->ball_grabbed && st->height > 0) {
-	        float desired_ball_x = (float)x - (st->grab_u * st->ball_diameter);
-	        float desired_ball_y = ((float)y - (st->grab_v * st->ball_diameter)) / (float)st->height;
+    if (st->pointer_down && st->grabbed_ball >= 0 &&
+        st->grabbed_ball < st->ball_count && st->height > 0) {
+        PoingoBall *ball = &st->balls[st->grabbed_ball];
+        float old_x = ball->x;
+        float old_y = ball->y;
+        float desired_ball_x = (float)x - st->grab_u * ball->diameter;
+        float desired_ball_y = ((float)y - st->grab_v * ball->diameter) /
+                               (float)st->height;
 
         float border_inset = 0.0f;
         float border_inset_norm = 0.0f;
-        float ball_diameter = st->ball_diameter;
-        float ball_diameter_norm = st->ball_diameter_norm;
+        float ball_diameter = ball->diameter;
+        float ball_diameter_norm = ball->diameter_norm;
 
-        st->ball_x = fmaxf(border_inset, fminf(desired_ball_x,
-                         (float)st->width - ball_diameter - border_inset));
-        st->ball_y = fmaxf(border_inset_norm, fminf(desired_ball_y,
-                         1.0f - ball_diameter_norm - border_inset_norm));
+        float new_x = fmaxf(border_inset, fminf(
+                            desired_ball_x,
+                            (float)st->width - ball_diameter - border_inset));
+        float new_y = fmaxf(border_inset_norm, fminf(
+                            desired_ball_y,
+                            1.0f - ball_diameter_norm - border_inset_norm));
 
-        st->slingshot_pull_x = desired_ball_x - st->ball_x;
-        st->slingshot_pull_y = desired_ball_y - st->ball_y;
+        st->slingshot_pull_x = desired_ball_x - new_x;
+        st->slingshot_pull_y = desired_ball_y - new_y;
+
+        int previous = (st->mouse_history_index + FREEDOM_MOUSE_HISTORY_SIZE - 2) %
+                       FREEDOM_MOUSE_HISTORY_SIZE;
+        uint32_t previous_time = st->mouse_history[previous].time;
+        if (previous_time > 0 && now > previous_time) {
+            float frames = 16.67f / (float)(now - previous_time);
+            float vx = (new_x - old_x) * frames;
+            float vy = (new_y - old_y) * (float)st->height * frames;
+            ball_set_velocity(ball, st->height, vx, vy);
+        }
+        sweep_grabbed_ball(st, old_x, old_y, new_x, new_y);
     }
 }
 
@@ -4002,8 +4508,10 @@ static void freerange_pointer_motion(void *data, struct wl_pointer *pointer,
 static void freerange_release_grab(FreedomState *st) {
     st->pointer_down = false;
 
-    if (st->ball_grabbed) {
-        st->ball_grabbed = false;
+    int grabbed = st->grabbed_ball;
+    st->grabbed_ball = -1;
+    if (grabbed >= 0 && grabbed < st->ball_count) {
+        PoingoBall *ball = &st->balls[grabbed];
 
         float slingshot_threshold_x = 20.0f;
         float slingshot_threshold_y = 20.0f / (float)st->height;
@@ -4013,22 +4521,24 @@ static void freerange_release_grab(FreedomState *st) {
         if (has_slingshot_x || has_slingshot_y) {
             float slingshot_scale = 0.3f * 3.0f;
             if (has_slingshot_x) {
-                st->ball_vx = fabsf(st->slingshot_pull_x * slingshot_scale);
-                st->ball_vx_direction = (st->slingshot_pull_x > 0.0f) ? -1 : 1;
+                ball->vx = fabsf(st->slingshot_pull_x * slingshot_scale);
+                ball->vx_direction = st->slingshot_pull_x > 0.0f ? -1 : 1;
             } else {
-                st->ball_vx = 0.0f;
+                ball->vx = 0.0f;
             }
             if (has_slingshot_y) {
-                st->ball_vy = -(st->slingshot_pull_y * slingshot_scale);
+                ball->vy = -(st->slingshot_pull_y * slingshot_scale);
             } else {
-                st->ball_vy = 0.0f;
+                ball->vy = 0.0f;
             }
 
             float max_vx = (float)st->width * 0.4f;
             float max_vy = 0.4f;
-            if (st->ball_vx > max_vx) st->ball_vx = max_vx;
-            if (fabsf(st->ball_vy) > max_vy) {
-                st->ball_vy = (st->ball_vy > 0.0f) ? max_vy : -max_vy;
+            if (ball->vx > max_vx) {
+                ball->vx = max_vx;
+            }
+            if (fabsf(ball->vy) > max_vy) {
+                ball->vy = ball->vy > 0.0f ? max_vy : -max_vy;
             }
         } else {
             uint32_t current_time = poingo_ticks_ms();
@@ -4057,27 +4567,30 @@ static void freerange_release_grab(FreedomState *st) {
                         float scale_factor_x = 2.0f * ms_to_frame_60fps;
                         float scale_factor_y = 1.0f * ms_to_frame_60fps;
 
-                        st->ball_vx = fabsf(vx_pixels_per_ms * scale_factor_x);
-                        st->ball_vx_direction = (vx_pixels_per_ms >= 0.0f) ? 1 : -1;
-                        st->ball_vy = (vy_pixels_per_ms * scale_factor_y) / (float)st->height;
+                        ball->vx = fabsf(vx_pixels_per_ms * scale_factor_x);
+                        ball->vx_direction = vx_pixels_per_ms >= 0.0f ? 1 : -1;
+                        ball->vy = (vy_pixels_per_ms * scale_factor_y) /
+                                   (float)st->height;
 
                         float max_vx = (float)st->width * 0.4f;
                         float max_vy = 0.4f;
-                        if (st->ball_vx > max_vx) st->ball_vx = max_vx;
-                        if (fabsf(st->ball_vy) > max_vy) {
-                            st->ball_vy = (st->ball_vy > 0.0f) ? max_vy : -max_vy;
+                        if (ball->vx > max_vx) {
+                            ball->vx = max_vx;
+                        }
+                        if (fabsf(ball->vy) > max_vy) {
+                            ball->vy = ball->vy > 0.0f ? max_vy : -max_vy;
                         }
                     } else {
-                        st->ball_vx = 0.0f;
-                        st->ball_vy = 0.0f;
+                        ball->vx = 0.0f;
+                        ball->vy = 0.0f;
                     }
                 } else {
-                    st->ball_vx = 0.0f;
-                    st->ball_vy = 0.0f;
+                    ball->vx = 0.0f;
+                    ball->vy = 0.0f;
                 }
             } else {
-                st->ball_vx = 0.0f;
-                st->ball_vy = 0.0f;
+                ball->vx = 0.0f;
+                ball->vy = 0.0f;
             }
         }
 
@@ -4101,12 +4614,13 @@ static void freerange_ring_menu_button(FreedomState *st, int rbtn, bool pressed)
         g_picker_slot = -1;
         g_picker_locked = false;
         ringmenu_button(g_menu, rbtn, pressed);
-        uint8_t light_rgb[3], dark_rgb[3];
-        memcpy(light_rgb, g_color_light_rgb, 3);
-        memcpy(dark_rgb, g_color_dark_rgb, 3);
-        if (slot == 0) memcpy(light_rgb, g_picker_color, 3);
-        else memcpy(dark_rgb, g_picker_color, 3);
-        freerange_regen_transition(st, POINGO_MODE_KEEP, light_rgb, dark_rgb);
+        if (st->menu_ball >= 0 && st->menu_ball < st->ball_count) {
+            PoingoBall *ball = &st->balls[st->menu_ball];
+            uint8_t *target = slot == 0 ? ball->light_rgb : ball->dark_rgb;
+            memcpy(target, g_picker_color, 3);
+            memcpy(g_color_light_rgb, ball->light_rgb, 3);
+            memcpy(g_color_dark_rgb, ball->dark_rgb, 3);
+        }
         poingo_menu_sync_drops();
         return;
     }
@@ -4118,22 +4632,29 @@ static void freerange_ring_menu_button(FreedomState *st, int rbtn, bool pressed)
         g_picker_locked = false;
     }
     if (result > 0) {
-        if (result == POINGO_MENU_NOSTALGIA) {
-            const uint8_t light_rgb[3] = { 255, 255, 255 };
-            const uint8_t dark_rgb[3] = { 255, 0, 0 };
-            freerange_regen_transition(st, POINGO_MODE_NOSTALGIA, light_rgb, dark_rgb);
-        } else if (result == POINGO_MENU_POINGO) {
-            const uint8_t light_rgb[3] = { COLOR_LIGHT_R, COLOR_LIGHT_G, COLOR_LIGHT_B };
-            const uint8_t dark_rgb[3] = { COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B };
-            freerange_regen_transition(st, POINGO_MODE_POINGO, light_rgb, dark_rgb);
-        } else if (result == POINGO_MENU_NEWCOLOR) {
-            freerange_regen_transition(st, POINGO_MODE_KEEP, NULL, NULL);
+        PoingoBall *ball = st->menu_ball >= 0 && st->menu_ball < st->ball_count
+                               ? &st->balls[st->menu_ball] : NULL;
+        if (result == POINGO_MENU_NOSTALGIA && ball) {
+            set_ball_mode(ball, BALL_MODE_NOSTALGIA);
+        } else if (result == POINGO_MENU_POINGO && ball) {
+            set_ball_mode(ball, BALL_MODE_POINGO);
+        } else if (result == POINGO_MENU_NEWCOLOR && ball) {
+            random_ball_palette(ball);
+        } else if (result == POINGO_MENU_ADD_BALL) {
+            (void)add_ball(st);
+        } else if (result == POINGO_MENU_REMOVE_BALL) {
+            remove_ball(st, st->menu_ball);
         } else if (result == POINGO_MENU_MUTE) {
             toggle_master_mute();
         } else if (result == POINGO_MENU_GHOST) {
             st->ghost_mode = true;
+            g_ghost_mute = true;
         } else if (result == POINGO_MENU_QUIT) {
             freerange_request_graceful_shutdown(st);
+        }
+        if (ball && result != POINGO_MENU_REMOVE_BALL) {
+            memcpy(g_color_light_rgb, ball->light_rgb, 3);
+            memcpy(g_color_dark_rgb, ball->dark_rgb, 3);
         }
         poingo_menu_sync_drops();
     }
@@ -4240,7 +4761,11 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
     }
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_RIGHT) {
-        if (g_menu) {
+        int target = ball_at(st, st->pointer_x, st->pointer_y);
+        if (g_menu && target >= 0) {
+            st->menu_ball = target;
+            memcpy(g_color_light_rgb, st->balls[target].light_rgb, 3);
+            memcpy(g_color_dark_rgb, st->balls[target].dark_rgb, 3);
             g_picker_slot = -1;
             g_picker_locked = false;
             poingo_menu_sync_drops();
@@ -4272,14 +4797,15 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
         st->pointer_down = true;
 
-        if (is_mouse_over_ball(st->pointer_x, st->pointer_y,
-                               st->ball_x, st->ball_y,
-                               st->width, st->height)) {
-            st->ball_grabbed = true;
-            if (st->ball_diameter > 0.0f) {
-                float ball_y_pixels = st->ball_y * (float)st->height;
-                st->grab_u = ((float)st->pointer_x - st->ball_x) / st->ball_diameter;
-                st->grab_v = ((float)st->pointer_y - ball_y_pixels) / st->ball_diameter;
+        int target = ball_at(st, st->pointer_x, st->pointer_y);
+        if (target >= 0) {
+            PoingoBall *ball = &st->balls[target];
+            st->grabbed_ball = target;
+            if (ball->diameter > 0.0f) {
+                float ball_y_pixels = ball->y * (float)st->height;
+                st->grab_u = ((float)st->pointer_x - ball->x) / ball->diameter;
+                st->grab_v = ((float)st->pointer_y - ball_y_pixels) /
+                             ball->diameter;
                 st->grab_u = fmaxf(0.0f, fminf(1.0f, st->grab_u));
                 st->grab_v = fmaxf(0.0f, fminf(1.0f, st->grab_v));
             } else {
@@ -4295,34 +4821,38 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
 }
 
 static void freerange_adjust_ball_scale(FreedomState *st, int direction) {
-    if (!st || !st->ball_grabbed || direction == 0) {
+    if (!st || st->grabbed_ball < 0 ||
+        st->grabbed_ball >= st->ball_count || direction == 0) {
         return;
     }
 
-    g_freerange_ball_scale += (float)direction * FREEDOM_BALL_SCALE_STEP;
-    g_freerange_ball_scale = clamp_freerange_ball_scale(g_freerange_ball_scale);
+    PoingoBall *ball = &st->balls[st->grabbed_ball];
+    ball->scale += (float)direction * FREEDOM_BALL_SCALE_STEP;
+    ball->scale = clamp_freerange_ball_scale(ball->scale);
 
     if (st->width > 0 && st->height > 0) {
         float prop_x = (float)st->width / CANVAS_WIDTH;
         float prop_y = (float)st->height / CANVAS_HEIGHT;
         float total_prop = fminf(prop_x, prop_y);
-        float ball_diameter = 124.0f * total_prop * g_freerange_ball_scale;
-        st->ball_diameter = ball_diameter;
-        st->ball_diameter_norm = ball_diameter / (float)st->height;
+        float ball_diameter = BALL_BASE_DIAMETER * total_prop * ball->scale;
+        ball->diameter = ball_diameter;
+        ball->diameter_norm = ball_diameter / (float)st->height;
 
         float border_inset = 0.0f;
         float border_inset_norm = 0.0f;
         float desired_ball_x = (float)st->pointer_x - (st->grab_u * ball_diameter);
         float desired_ball_y = ((float)st->pointer_y - (st->grab_v * ball_diameter)) / (float)st->height;
 
-        st->ball_x = fmaxf(border_inset, fminf(desired_ball_x,
-                         (float)st->width - ball_diameter - border_inset));
-        st->ball_y = fmaxf(border_inset_norm, fminf(desired_ball_y,
-                         1.0f - st->ball_diameter_norm - border_inset_norm));
-        st->slingshot_pull_x = desired_ball_x - st->ball_x;
-        st->slingshot_pull_y = desired_ball_y - st->ball_y;
+        ball->x = fmaxf(border_inset, fminf(desired_ball_x,
+                        (float)st->width - ball_diameter - border_inset));
+        ball->y = fmaxf(border_inset_norm, fminf(desired_ball_y,
+                        1.0f - ball->diameter_norm - border_inset_norm));
+        st->slingshot_pull_x = desired_ball_x - ball->x;
+        st->slingshot_pull_y = desired_ball_y - ball->y;
 
-        float rescaled_for_sound = remap_normalized_scale_to_sound(total_prop * g_freerange_ball_scale);
+        float rescaled_for_sound = remap_normalized_scale_to_sound(
+            total_prop * ball->scale);
+        g_bounce_slot = st->grabbed_ball;
         mark_sounds_dirty(rescaled_for_sound);
     }
 }
@@ -4332,7 +4862,7 @@ static void freerange_pointer_axis(void *data, struct wl_pointer *pointer,
     (void)pointer;
     (void)time;
     FreedomState *st = data;
-    if (!st || !st->ball_grabbed) {
+    if (!st || st->grabbed_ball < 0 || st->grabbed_ball >= st->ball_count) {
         return;
     }
     if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
@@ -4411,15 +4941,26 @@ static void freerange_keyboard_key(void *data, struct wl_keyboard *keyboard,
         } else if (key == KEY_M) {
             toggle_master_mute();
         } else if (key == KEY_A) {
-            const uint8_t light_rgb[3] = { 255, 255, 255 };
-            const uint8_t dark_rgb[3] = { 255, 0, 0 };
-            freerange_regen_transition(st, POINGO_MODE_NOSTALGIA, light_rgb, dark_rgb);
+            int target = st->grabbed_ball >= 0
+                             ? st->grabbed_ball
+                             : ball_at(st, st->pointer_x, st->pointer_y);
+            if (target >= 0) {
+                set_ball_mode(&st->balls[target], BALL_MODE_NOSTALGIA);
+            }
         } else if (key == KEY_P) {
-            const uint8_t light_rgb[3] = { COLOR_LIGHT_R, COLOR_LIGHT_G, COLOR_LIGHT_B };
-            const uint8_t dark_rgb[3] = { COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B };
-            freerange_regen_transition(st, POINGO_MODE_POINGO, light_rgb, dark_rgb);
+            int target = st->grabbed_ball >= 0
+                             ? st->grabbed_ball
+                             : ball_at(st, st->pointer_x, st->pointer_y);
+            if (target >= 0) {
+                set_ball_mode(&st->balls[target], BALL_MODE_POINGO);
+            }
         } else if (key == KEY_C) {
-            freerange_regen_transition(st, POINGO_MODE_KEEP, NULL, NULL);
+            int target = st->grabbed_ball >= 0
+                             ? st->grabbed_ball
+                             : ball_at(st, st->pointer_x, st->pointer_y);
+            if (target >= 0) {
+                random_ball_palette(&st->balls[target]);
+            }
         } else if (key == KEY_SPACE) {
             st->ghost_mode = !st->ghost_mode;
             g_ghost_mute = st->ghost_mode;
@@ -4623,7 +5164,8 @@ static int run_freerange_wayland(bool start_muted) {
     FreedomState st = {0};
     st.running = true;
     st.make_noise = true;
-    st.last_total_prop = -1.0f;
+    st.grabbed_ball = -1;
+    st.menu_ball = -1;
     g_suppress_hud = false;
     g_freerange_ball_scale = clamp_freerange_ball_scale(g_freerange_ball_scale);
 
@@ -4726,46 +5268,8 @@ static int run_freerange_wayland(bool start_muted) {
     }
 
     FreedomFrameSet frames = {0};
-    bool use_blank_frames = freerange_prepare_blank_frames(&frames, frame_count);
-    if (use_blank_frames) {
-        st.frames_ref = &frames;
-        st.color_regen_angle_period = angle_period;
-        if (!freerange_color_regen_prepare_assets(&st, &frames) ||
-            !freerange_regen_workspace_prepare(&st, &frames)) {
-            use_blank_frames = false;
-        } else {
-            freerange_color_regen_start(&st, &frames);
-            /* The one regen that is an arrival rather than a change. */
-            st.color_regen_fade_in = true;
-        }
-    }
-    if (!use_blank_frames) {
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        if (!freerange_generate_frames(&frames, frame_count, angle_period)) {
-            shutdown_audio();
-            eglDestroyContext(st.egl_display, st.egl_context);
-            eglTerminate(st.egl_display);
-            wl_display_disconnect(st.display);
-            return 1;
-        }
-        st.frames_ref = &frames;
-        st.color_regen_angle_period = angle_period;
-        if (!freerange_regen_workspace_prepare(&st, &frames)) {
-            fprintf(stderr, "Failed to allocate regeneration workspace\n");
-            freerange_destroy_frames(&frames);
-            shutdown_audio();
-            eglDestroyContext(st.egl_display, st.egl_context);
-            eglTerminate(st.egl_display);
-            wl_display_disconnect(st.display);
-            return 1;
-        }
-    }
-
-    /* Reserve regeneration assets even when the initial frame set was fully
-     * generated. Runtime color/mode changes must never allocate. */
-    if (!freerange_color_regen_prepare_assets(&st, &frames)) {
-        fprintf(stderr, "Failed to allocate regeneration assets\n");
+    if (!make_basis_frames(&frames, frame_count, angle_period)) {
+        fprintf(stderr, "Failed to generate ball frames\n");
         freerange_destroy_frames(&frames);
         shutdown_audio();
         eglDestroyContext(st.egl_display, st.egl_context);
@@ -4773,6 +5277,7 @@ static int run_freerange_wayland(bool start_muted) {
         wl_display_disconnect(st.display);
         return 1;
     }
+    st.frames_ref = &frames;
 
     st.surface = wl_compositor_create_surface(st.compositor);
     if (!st.surface) {
@@ -4889,6 +5394,8 @@ static int run_freerange_wayland(bool start_muted) {
         { .label = "NOSTALGIA" },
         { .label = "POINGO" },
         { .label = "NEW COLOR" },
+        { .label = "+ BALL" },
+        { .label = "- BALL" },
         { .label = "MUTE", .led = RINGMENU_LED_OFF },
         { .label = "GHOST", .led = RINGMENU_LED_OFF },
         { .label = "QUIT" },
@@ -4983,35 +5490,41 @@ static int run_freerange_wayland(bool start_muted) {
         return 1;
     }
 
+    /* Runtime colors are shader uniforms now; only the uploaded masks remain. */
+    free(frames.frames);
+    frames.frames = NULL;
+
+    PoingoBall *first_ball = &st.balls[0];
+    first_ball->scale = g_freerange_ball_scale;
+    first_ball->mode = BALL_MODE_POINGO;
+    memcpy(first_ball->light_rgb, g_color_light_rgb, 3);
+    memcpy(first_ball->dark_rgb, g_color_dark_rgb, 3);
+    ball_size(first_ball, st.width, st.height);
     calculate_equilibrium_state(st.width, st.height,
                                 GRAVITY, g_floor_y_normalized,
                                 g_target_peak_y,
-                                &st.ball_y, &st.ball_vy, &(float){0});
-    st.ball_x = 100.0f;
-    st.ball_vx = get_natural_vx(st.width);
-    st.ball_vx_direction = 1;
+                                &first_ball->y, &first_ball->vy, &(float){0});
+    first_ball->x = 100.0f;
+    first_ball->vx = get_natural_vx(st.width);
+    first_ball->vx_direction = 1;
+    st.ball_count = 1;
     st.shutdown_pending = false;
     st.exit_fade = 0.0f;
     st.ball_cleared = false;
     st.shutdown_start_ticks = 0;
 
     {
-        float prop_x = st.width / CANVAS_WIDTH;
-        float prop_y = st.height / CANVAS_HEIGHT;
-        float total_prop = fminf(prop_x, prop_y);
-        float scaled_prop = total_prop * g_freerange_ball_scale;
-        st.ball_diameter = 124.0f * scaled_prop;
-        st.ball_diameter_norm = st.ball_diameter / (float)st.height;
         g_audio_sim_time = 0.0f;
         audio_predict_reset(g_audio_sim_time);
         build_audio_predict_buffer(&g_audio_predict,
                                    g_audio_sim_time,
-                                   st.ball_x, st.ball_y,
-                                   st.ball_vx, st.ball_vy,
-                                   st.ball_vx_direction,
+                                   first_ball->x, first_ball->y,
+                                   first_ball->vx, first_ball->vy,
+                                   first_ball->vx_direction,
                                    st.width,
                                    0.0f, 0.0f,
-                                   st.ball_diameter, st.ball_diameter_norm,
+                                   first_ball->diameter,
+                                   first_ball->diameter_norm,
                                    1.0f / frames_per_second);
     }
 
@@ -5029,9 +5542,6 @@ static int run_freerange_wayland(bool start_muted) {
     FreerangeRect damage_hist[FREERANGE_DAMAGE_HISTORY] = {0};
     int damage_hist_depth = 0;
 
-    float in_reg_x = -1e9f, in_reg_y = -1e9f, in_reg_d = -1e9f;
-    int   in_reg_w = 0, in_reg_h = 0;
-    bool  menu_open_in_reg = false;
     bool  in_reg_ghost = false;
 
     FrameCbData fr_cb = { .ready = true, .compositor_ms = 0 };
@@ -5114,7 +5624,7 @@ static int run_freerange_wayland(bool start_muted) {
     }
 
     while (st.running) {
-        bool was_ball_grabbed = st.ball_grabbed;
+        bool was_ball_grabbed = st.grabbed_ball >= 0;
         bool miss_this_frame  = false;
         {
             struct timespec _pe;
@@ -5220,7 +5730,8 @@ static int run_freerange_wayland(bool start_muted) {
         }
 
         update_audio_output_latency();
-        bool use_audio_prediction = g_audio_output_latency_valid;
+        bool use_audio_prediction = g_audio_output_latency_valid &&
+                                    st.ball_count == 1;
         float frame_elapsed = (float)delta_seconds;
         update_volume_hud(frame_elapsed);
         update_speed_hud(frame_elapsed);
@@ -5244,7 +5755,7 @@ static int run_freerange_wayland(bool start_muted) {
 
         bool hud_visible = freerange_gl_update_hud(&st);
 
-        if (was_ball_grabbed && !st.ball_grabbed) {
+        if (was_ball_grabbed && st.grabbed_ball < 0) {
             audio_predict_reset(g_audio_sim_time);
         }
 
@@ -5255,17 +5766,13 @@ static int run_freerange_wayland(bool start_muted) {
             damage_hist_depth = 0;
         }
 
-        float prop_x = st.width / CANVAS_WIDTH;
-        float prop_y = st.height / CANVAS_HEIGHT;
-        float total_prop = fminf(prop_x, prop_y);
-        float scaled_prop = total_prop * g_freerange_ball_scale;
-        st.ball_diameter = 124.0f * scaled_prop;
-        st.ball_diameter_norm = st.ball_diameter / (float)st.height;
-
-        if (fabsf(scaled_prop - st.last_total_prop) > 0.001f) {
-            float rescaled_for_sound = remap_normalized_scale_to_sound(scaled_prop);
-            mark_sounds_dirty(rescaled_for_sound);
-            st.last_total_prop = scaled_prop;
+        for (int i = 0; i < st.ball_count; i++) {
+            ball_size(&st.balls[i], st.width, st.height);
+            st.balls[i].x = clampf(st.balls[i].x, 0.0f,
+                                   (float)st.width - st.balls[i].diameter);
+            st.balls[i].y = clampf(st.balls[i].y, 0.0f,
+                                   g_floor_y_normalized -
+                                   st.balls[i].diameter_norm);
         }
 
         float frame_advance = (float)(sim_delta * frames_per_second);
@@ -5279,31 +5786,25 @@ static int run_freerange_wayland(bool start_muted) {
         ball_cursor_animate(st.phase_i, frame_count);
 
         if (!st.ball_cleared) {
-            update_ball_physics(&st.ball_x, &st.ball_y,
-                                &st.ball_vx, &st.ball_vy,
-                                &st.ball_vx_direction,
-                                st.width,
-                                0.0f, 0.0f,
-                                st.ball_diameter, st.ball_diameter_norm,
-                                sim_delta,
-                                st.ball_grabbed,
-                                !use_audio_prediction && st.make_noise,
-                                g_actual_bounce_serial,
-                                NULL, NULL, 0, 0.0f);
+            BallSound sound = !use_audio_prediction && st.make_noise
+                                  ? BALL_SOUND_PLAY : BALL_SOUND_SILENT;
+            step_balls(&st, sim_delta, sound);
         }
 
         g_audio_sim_time += (float)sim_delta;
         if (use_audio_prediction &&
-            !st.ball_grabbed && !st.ball_cleared) {
+            st.grabbed_ball < 0 && !st.ball_cleared) {
+            PoingoBall *ball = &st.balls[0];
+            ball_sound(ball, 0);
             uint64_t apb_t0 = poingo_perf_counter();
             build_audio_predict_buffer(&g_audio_predict,
                                        g_audio_sim_time,
-                                       st.ball_x, st.ball_y,
-                                       st.ball_vx, st.ball_vy,
-                                       st.ball_vx_direction,
+                                       ball->x, ball->y,
+                                       ball->vx, ball->vy,
+                                       ball->vx_direction,
                                        st.width,
                                        0.0f, 0.0f,
-                                       st.ball_diameter, st.ball_diameter_norm,
+                                       ball->diameter, ball->diameter_norm,
                                        (float)sim_delta);
             double apb_ms =
                 get_perf_seconds(apb_t0, poingo_perf_counter()) * 1000.0;
@@ -5336,22 +5837,9 @@ static int run_freerange_wayland(bool start_muted) {
         }
 
         if (fr_cb.ready) {
-            bool menu_open_for_input = g_menu && ringmenu_is_open(g_menu);
             bool ghost_changed = (st.ghost_mode != in_reg_ghost);
-            if (!st.ball_cleared &&
-                (st.ball_x != in_reg_x || st.ball_y != in_reg_y ||
-                 st.ball_diameter != in_reg_d ||
-                 st.width != in_reg_w || st.height != in_reg_h ||
-                 menu_open_for_input != menu_open_in_reg || ghost_changed)) {
-                freerange_update_input_region(st.compositor, st.surface,
-                                            st.width, st.height,
-                                            st.ball_x, st.ball_y, st.ball_diameter, st.ghost_mode);
-                in_reg_x = st.ball_x;
-                in_reg_y = st.ball_y;
-                in_reg_d = st.ball_diameter;
-                in_reg_w = st.width;
-                in_reg_h = st.height;
-                menu_open_in_reg = menu_open_for_input;
+            if (!st.ball_cleared) {
+                freerange_update_input_region(&st);
                 in_reg_ghost = st.ghost_mode;
                 if (ghost_changed) {
                     damage_hist_depth = 0;
@@ -5533,11 +6021,17 @@ static int run_freerange_wayland(bool start_muted) {
 
             FreerangeRect cur_rect = {0, 0, 0, 0};
             {
-                float bx, by, bw, bh;
-                if (freerange_ball_dest_quad(&st, &frames, render_extrap_dt,
-                                             &bx, &by, &bw, &bh)) {
-                    FreerangeRect br = { (int)floorf(bx) - 2, (int)floorf(by) - 2,
-                                         (int)ceilf(bw) + 4, (int)ceilf(bh) + 4 };
+                for (int i = 0; i < st.ball_count; i++) {
+                    float bx, by, bw, bh;
+                    if (!freerange_ball_dest_quad(&st, &st.balls[i], &frames,
+                                                  render_extrap_dt,
+                                                  &bx, &by, &bw, &bh)) {
+                        continue;
+                    }
+                    FreerangeRect br = {
+                        (int)floorf(bx) - 2, (int)floorf(by) - 2,
+                        (int)ceilf(bw) + 4, (int)ceilf(bh) + 4
+                    };
                     freerange_rect_union(&cur_rect, &br);
                 }
                 if (hud_visible && st.gl_hud_w > 0 && st.gl_hud_h > 0) {
@@ -5600,6 +6094,7 @@ static int run_freerange_wayland(bool start_muted) {
                 float by = (float)GHOST_ICON_MARGIN;
                 
                 glUseProgram(st.gl_program);
+                glUniform1f(st.gl_recolor_loc, 0.0f);
                 glActiveTexture(GL_TEXTURE0);
                 glEnableVertexAttribArray(st.gl_pos_loc);
                 glEnableVertexAttribArray(st.gl_uv_loc);
@@ -5647,7 +6142,18 @@ static int run_freerange_wayland(bool start_muted) {
                     px0, py0, 0.0f, 0.0f,
                     px1, py0, 1.0f, 0.0f
                 };
-                glBindTexture(GL_TEXTURE_2D, st.gl_textures[0]);
+                PoingoBall *ghost_ball = &st.balls[0];
+                int ghost_frame = (int)ghost_ball->mode * frame_count;
+                glBindTexture(GL_TEXTURE_2D, st.gl_textures[ghost_frame]);
+                glUniform1f(st.gl_recolor_loc, 1.0f);
+                glUniform3f(st.gl_light_loc,
+                            ghost_ball->light_rgb[0] / 255.0f,
+                            ghost_ball->light_rgb[1] / 255.0f,
+                            ghost_ball->light_rgb[2] / 255.0f);
+                glUniform3f(st.gl_dark_loc,
+                            ghost_ball->dark_rgb[0] / 255.0f,
+                            ghost_ball->dark_rgb[1] / 255.0f,
+                            ghost_ball->dark_rgb[2] / 255.0f);
                 glVertexAttribPointer(st.gl_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), bverts);
                 glVertexAttribPointer(st.gl_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), bverts + 2);
                 freerange_gl_blend_premul();
@@ -5814,6 +6320,7 @@ static int run_freerange_wayland(bool start_muted) {
                     x1, y1, 1.f, 1.f,
                 };
                 glUseProgram(st.gl_program);
+                glUniform1f(st.gl_recolor_loc, 0.0f);
                 glBindTexture(GL_TEXTURE_2D, g_menu_tex);
                 glVertexAttribPointer(st.gl_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), mverts);
                 glVertexAttribPointer(st.gl_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), mverts + 2);

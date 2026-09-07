@@ -8,7 +8,7 @@ realities such as variable refresh rates, external displays, and high-latency
 audio paths.
 
 ## Features
-- Physics-driven bouncing-ball animation.
+- Up to six independently styled balls with hollow-shell collisions.
 - A pure-Wayland client: its own `wl_surface` + EGL/GLES renderer, native
   `wl_pointer`/`wl_keyboard` input, and `xkbcommon` for the keymap. No SDL, no
   toolkit.
@@ -35,20 +35,20 @@ checklist is in `../list.todo`.
 --mute                 Start with audio muted
 --light-color <color>  Light ball color (R,G,B or #RRGGBB)
 --dark-color <color>   Dark ball color (R,G,B or #RRGGBB)
---start-size <scale>   Initial ball size (0.25 to 2.0)
+--start-size <scale>   Initial ball size (0.25 to 1.5)
 --debug                Print FPS to stderr and show the FPS HUD
 --help, -h             Show help
 ```
 
 ## Controls
+- Right-click a ball for `+ BALL`, `- BALL`, and its style controls
+- Drag a ball; use the wheel or `[` / `]` while holding it to resize it
 - `M` mute
 - `,` / `.` or `<` / `>` speed down / up
-- `[` / `]` size down / up
-- `C` randomize colors
+- `C` randomize the ball under the pointer
 - `D` toggle debug HUD
 - `SPACE` toggle help
-- `A` enter `nostalgia mode`
-- `P` return to normal Poingo mode
+- `A` / `P` style the ball under the pointer
 
 ## Audio and latency
 Most of Poingo's audio machinery exists for one reason: the ball strikes a wall
@@ -56,8 +56,9 @@ at a *known instant*, and a bounce sound that arrives even a couple hundredths o
 a second late reads as wrong. A continuous or fire-and-forget sound can absorb
 that slack; a sharp impact synced to a visible collision cannot.
 
-So Poingo doesn't just play a sound when the ball bounces — it plays it *ahead of
-time*. While its native PipeWire stream is running, it reads the stream timing
+With one ball, Poingo plays wall sounds *ahead of time*. With interacting balls,
+impacts play immediately because another ball can invalidate a prediction. Its
+native PipeWire stream reads the stream timing
 state and combines the queued samples, buffered samples, and remaining graph
 delay into an end-to-end output-latency estimate. The predictive scheduler
 queues each bounce that much earlier, so the sound leaves the speakers exactly
