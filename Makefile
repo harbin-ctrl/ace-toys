@@ -57,10 +57,11 @@ deb:
 
 debs: deb
 
+# --reinstall: a rebuild keeps its version, and apt skips an equal version.
 install: deb
 	@set -euo pipefail; \
 	package=../ace-toys_$$(dpkg-parsechangelog -SVersion)_$$(dpkg --print-architecture).deb; \
-	if [ "$$(id -u)" -eq 0 ]; then apt install -y "$$package"; else sudo apt install -y "$$package"; fi
+	if [ "$$(id -u)" -eq 0 ]; then apt install -y --reinstall "$$package"; else sudo apt install -y --reinstall "$$package"; fi
 
 lint:
 	$(MAKE) cppcheck
