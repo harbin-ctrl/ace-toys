@@ -11,7 +11,7 @@ byte-identical copies of these files; now they live once, here.
 - `ace-icon-*.png` (+ `ace-icon.svg` source) — the category icon at the
   hicolor sizes.
 - `install.mk` — include-able make fragment with
-  `ace-install[-user]` / `ace-uninstall[-user]` targets;
+  `ace-install` / `ace-uninstall` targets;
   see its header comment for usage.
 
 Each toy still owns its own `.desktop` entry and app icons; only the shared

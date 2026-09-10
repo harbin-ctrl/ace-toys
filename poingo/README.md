@@ -27,8 +27,9 @@ make          # builds ./poingo
 
 Development packages: `wayland-client`, `wayland-egl`, `egl`, `glesv2`,
 `xkbcommon`, and PipeWire (`libpipewire-0.3`; audio).
-Build and install through the Makefile targets. The project-wide package
-checklist is in `../list.todo`.
+Install with `make install` at the repository root, which builds and
+installs the `ace-toys` package; its `debian/control` lists the build
+dependencies.
 
 ## Options
 ```

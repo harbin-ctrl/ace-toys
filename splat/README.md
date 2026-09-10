@@ -49,16 +49,17 @@ it left the can long ago.
 
 Needs Wayland + EGL/GLESv2 and PipeWire development packages, plus
 `wayland-scanner`. The native PipeWire spray-can hiss is managed by
-`libtoyaudio`. Also expects the shared library
-checkouts `~/ring-menu` (the circular menu) and
-`~/ace-packaging` (the Ace menu category); override with
-`RINGMENU_DIR=` / `ACE_DIR=`.
+`libtoyaudio`. Also uses the repository's shared
+`ring-menu` (the circular menu) and `ace-packaging` (the Ace
+menu category); override with `RINGMENU_DIR=` / `ACE_DIR=`.
 
     make            # splat + the paintbrush icons
     make run
     make test       # offscreen engine test: sprays, splats, layering,
                     # erasing, cursors — writes PNGs and checks the models
-    make install-user
+
+Install with `make install` at the repository root, which builds and
+installs the `ace-toys` package.
 
 ## Lineage
 

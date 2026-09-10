@@ -4,10 +4,10 @@ Ace is this project: the shared libraries (`toy-audio`, `ring-menu`, `shared`,
 `ace-packaging`) and the toys that link them (`splat`, `poingo`, `balloons`).
 The repository is `ace-toys`.
 
-- Ace is installed user-locally, never to the system. Use `make install-user`
-  and `make uninstall-user`; both stay under `$HOME` and need no sudo. Never
-  `sudo make install` — it writes to `$PREFIX`, and a stale system copy
-  silently shadows the user one on `PATH`.
+- Ace is installed only as the `ace-toys` Debian package: `make install` at the
+  repository root builds it and installs it with apt. Never install a toy by
+  hand (`make -C <toy> install`) — it writes to `$PREFIX`, and that copy
+  silently shadows the packaged one on `PATH`.
 
 - When writing something intended for human consumption, (comment, commit message, reply to prompt) use as few words as possible. Pick every word meticulously to reduce the volume to a strict minimum. Be down to the point. Less is more.
 

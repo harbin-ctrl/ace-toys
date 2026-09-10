@@ -27,12 +27,10 @@ The hanging **string is not part of the balloon body** — it is one shared, col
 
 ## Build
 
-Install the project-wide development packages listed in `list.todo`, then run
-`make` from the repository root. To install locally afterward, run:
-
-```bash
-make install-user
-```
+Install the build dependencies in `debian/control` (`dpkg-checkbuilddeps`
+names any that are missing), then run `make` from the repository root. To
+install, run `make install` there; it builds and installs the `ace-toys`
+package.
 
 ## Usage
 
