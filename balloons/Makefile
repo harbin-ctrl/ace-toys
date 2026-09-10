@@ -103,6 +103,9 @@ icon_maker: icon_maker.o $(LODEPNG_LIB)
 icons: icon_maker
 	./icon_maker assets
 
+# The caches are refreshed only for a live install. A staged one (DESTDIR,
+# as in a package build) would otherwise ship system-wide caches; the
+# package's triggers refresh the real ones.
 install: $(TARGET) icons ace-install
 	install -Dm755 $(TARGET) "$(DESTDIR)$(BINDIR)/$(TARGET)"
 	install -Dm644 balloons.desktop "$(DESTDIR)$(DATADIR)/applications/balloons.desktop"
@@ -110,8 +113,10 @@ install: $(TARGET) icons ace-install
 		install -Dm644 assets/icon_$${size}x$${size}.png \
 			"$(DESTDIR)$(DATADIR)/icons/hicolor/$${size}x$${size}/apps/balloons.png"; \
 	done
-	update-desktop-database "$(DESTDIR)$(DATADIR)/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -t -q "$(DESTDIR)$(DATADIR)/icons/hicolor" 2>/dev/null || true
+	if [ -z "$(DESTDIR)" ]; then \
+		update-desktop-database "$(DESTDIR)$(DATADIR)/applications" 2>/dev/null || true; \
+		gtk-update-icon-cache -f -t -q "$(DESTDIR)$(DATADIR)/icons/hicolor" 2>/dev/null || true; \
+	fi
 
 uninstall: ace-uninstall
 	$(RM) "$(DESTDIR)$(BINDIR)/$(TARGET)"
@@ -119,5 +124,7 @@ uninstall: ace-uninstall
 	for size in $(ICON_SIZES); do \
 		$(RM) "$(DESTDIR)$(DATADIR)/icons/hicolor/$${size}x$${size}/apps/balloons.png"; \
 	done
-	update-desktop-database "$(DESTDIR)$(DATADIR)/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -t -q "$(DESTDIR)$(DATADIR)/icons/hicolor" 2>/dev/null || true
+	if [ -z "$(DESTDIR)" ]; then \
+		update-desktop-database "$(DESTDIR)$(DATADIR)/applications" 2>/dev/null || true; \
+		gtk-update-icon-cache -f -t -q "$(DESTDIR)$(DATADIR)/icons/hicolor" 2>/dev/null || true; \
+	fi

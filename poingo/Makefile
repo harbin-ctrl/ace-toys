@@ -87,6 +87,9 @@ test_poingo_tsan: $(TEST_DEPS)
 run: poingo
 	./poingo
 
+# The caches are refreshed only for a live install. A staged one (DESTDIR,
+# as in a package build) would otherwise ship system-wide caches; the
+# package's triggers refresh the real ones.
 install: poingo icon_maker icons ace-install
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 755 poingo "$(DESTDIR)$(PREFIX)/bin/poingo"
@@ -99,8 +102,10 @@ install: poingo icon_maker icons ace-install
 		install -d "$(DESTDIR)$(PREFIX)/share/icons/hicolor/$${size}x$${size}/apps"; \
 		install -m 644 icon_$${size}.png "$(DESTDIR)$(PREFIX)/share/icons/hicolor/$${size}x$${size}/apps/poingo.png"; \
 	done
-	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
+	if [ -z "$(DESTDIR)" ]; then \
+		update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true; \
+		gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true; \
+	fi
 
 uninstall: ace-uninstall
 	$(RM) "$(DESTDIR)$(PREFIX)/bin/poingo"
@@ -110,8 +115,10 @@ uninstall: ace-uninstall
 	for size in $(ICON_SIZES); do \
 		$(RM) "$(DESTDIR)$(PREFIX)/share/icons/hicolor/$${size}x$${size}/apps/poingo.png"; \
 	done
-	update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true
-	gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true
+	if [ -z "$(DESTDIR)" ]; then \
+		update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true; \
+		gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true; \
+	fi
 
 WAYLAND_PROTOCOLS_DIR ?= /usr/share/wayland-protocols
 
