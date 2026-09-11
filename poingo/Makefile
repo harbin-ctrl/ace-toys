@@ -70,6 +70,7 @@ debug: all
 # opens a display. The plain build covers physics and the command line; the
 # ThreadSanitizer build is what catches the regeneration races.
 TEST_DEPS := test_poingo.c poingo.c xdg-shell-client-protocol.h \
+	xdg-shell-protocol.c \
 	$(RINGMENU_LIB) $(TOYAUDIO_LIB) $(GHOSTICON_LIB)
 
 test: test_poingo test_poingo_tsan

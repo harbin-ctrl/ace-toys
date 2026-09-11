@@ -37,7 +37,8 @@ dependencies.
 --light-color <color>  Light ball color (R,G,B or #RRGGBB)
 --dark-color <color>   Dark ball color (R,G,B or #RRGGBB)
 --start-size <scale>   Initial ball size (0.25 to 1.5)
---debug                Print FPS to stderr and show the FPS HUD
+--audit-predict        Count expected and predicted impacts
+--debug                Write performance diagnostics
 --help, -h             Show help
 ```
 
@@ -45,10 +46,9 @@ dependencies.
 - Right-click a ball for `+ BALL`, `- BALL`, and its style controls
 - Drag a ball; use the wheel or `[` / `]` while holding it to resize it
 - `M` mute
-- `,` / `.` or `<` / `>` speed down / up
+- Left / Right speed down / up
 - `C` randomize the ball under the pointer
-- `D` toggle debug HUD
-- `SPACE` toggle help
+- `SPACE` toggle Ghost mode
 - `A` / `P` style the ball under the pointer
 
 ## Audio and latency

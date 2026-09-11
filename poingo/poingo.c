@@ -1242,7 +1242,9 @@ static bool parse_color_arg(const char *value, uint8_t out_rgb[3]) {
     }
 
     int r = -1, g = -1, b = -1;
-    if (sscanf(value, "%d,%d,%d", &r, &g, &b) == 3) {
+    int consumed = 0;
+    if (sscanf(value, "%d,%d,%d%n", &r, &g, &b, &consumed) == 3 &&
+        value[consumed] == '\0') {
         if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
             return false;
         }
@@ -2057,6 +2059,10 @@ typedef struct {
     PoingoAtomic *unit_done;
 } RegenWorkerCtx;
 
+enum {
+    FREERANGE_GLOBAL_NONE = 0,
+};
+
 typedef struct {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -2070,6 +2076,11 @@ typedef struct {
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *xdg_toplevel;
+    uint32_t compositor_name;
+    uint32_t shm_name;
+    uint32_t seat_name;
+    uint32_t output_name;
+    uint32_t wm_base_name;
 
     EGLDisplay egl_display;
     EGLContext egl_context;
@@ -2783,6 +2794,13 @@ static void ball_cursor_render_frames(void) {
     }
 }
 
+static void ball_cursor_destroy(void);
+
+static bool ball_cursor_fail(void) {
+    ball_cursor_destroy();
+    return false;
+}
+
 static bool ball_cursor_create(struct wl_shm *shm, struct wl_compositor *compositor) {
     if (!shm || !compositor) return false;
 
@@ -2795,28 +2813,40 @@ static bool ball_cursor_create(struct wl_shm *shm, struct wl_compositor *composi
     if (unlikely(ftruncate(fd, (off_t)total) < 0)) { close(fd); return false; }
     void *data = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (unlikely(data == MAP_FAILED)) { close(fd); return false; }
+    g_ball_cursor.map = data;
+    g_ball_cursor.map_size = total;
 
     struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, (int32_t)total);
+    if (!pool) {
+        close(fd);
+        return ball_cursor_fail();
+    }
     for (int f = 0; f < CURSOR_BALL_FRAMES; f++) {
         g_ball_cursor.buffers[f] = wl_shm_pool_create_buffer(
             pool, (int32_t)(f * frame_bytes),
             CURSOR_BUF, CURSOR_BUF, stride, WL_SHM_FORMAT_ARGB8888);
+        if (!g_ball_cursor.buffers[f]) {
+            wl_shm_pool_destroy(pool);
+            close(fd);
+            return ball_cursor_fail();
+        }
     }
     wl_shm_pool_destroy(pool);
     close(fd);
 
-    g_ball_cursor.map = data;
-    g_ball_cursor.map_size = total;
-
     g_ball_cursor.blade = malloc((size_t)CURSOR_BUF * CURSOR_BUF * 4);
-    if (!g_ball_cursor.blade) return false;
+    if (!g_ball_cursor.blade) {
+        return ball_cursor_fail();
+    }
     blade_render();
 
     compute_axis_vectors();
     ball_cursor_render_frames();
 
     g_ball_cursor.surface = wl_compositor_create_surface(compositor);
-    if (!g_ball_cursor.surface) return false;
+    if (!g_ball_cursor.surface) {
+        return ball_cursor_fail();
+    }
     wl_surface_attach(g_ball_cursor.surface, g_ball_cursor.buffers[0], 0, 0);
     wl_surface_damage(g_ball_cursor.surface, 0, 0, CURSOR_BUF, CURSOR_BUF);
     wl_surface_commit(g_ball_cursor.surface);
@@ -5022,6 +5052,18 @@ static const struct wl_keyboard_listener freerange_keyboard_listener = {
     .repeat_info = freerange_keyboard_repeat_info,
 };
 
+/* A removed pointer cannot send the release that ends its grab. */
+static void freerange_clear_pointer(FreedomState *st) {
+    if (!st) {
+        return;
+    }
+
+    st->pointer_down = false;
+    st->grabbed_ball = -1;
+    st->slingshot_pull_x = 0.0f;
+    st->slingshot_pull_y = 0.0f;
+}
+
 static void freerange_seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) {
     FreedomState *st = data;
     if (!st) {
@@ -5035,17 +5077,22 @@ static void freerange_seat_capabilities(void *data, struct wl_seat *seat, uint32
         st->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(st->keyboard, &freerange_keyboard_listener, st);
     }
-    if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && st->keyboard) {
-        wl_keyboard_destroy(st->keyboard);
-        st->keyboard = NULL;
+    if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD)) {
+        if (st->keyboard) {
+            wl_keyboard_destroy(st->keyboard);
+            st->keyboard = NULL;
+        }
         /* The keys held when it vanished will never see a release. */
         freerange_clear_held_keys(st);
     }
     /* The protocol asks clients to release the object whose capability has
        gone, the pointer included. */
-    if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && st->pointer) {
-        wl_pointer_destroy(st->pointer);
-        st->pointer = NULL;
+    if (!(capabilities & WL_SEAT_CAPABILITY_POINTER)) {
+        if (st->pointer) {
+            wl_pointer_destroy(st->pointer);
+            st->pointer = NULL;
+        }
+        freerange_clear_pointer(st);
     }
 }
 
@@ -5072,14 +5119,24 @@ static void freerange_registry_global(void *data, struct wl_registry *registry,
        killed for it. */
     #define BIND_VERSION(wanted) ((version) < (wanted) ? (version) : (uint32_t)(wanted))
 
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    if (strcmp(interface, wl_compositor_interface.name) == 0 && !st->compositor) {
         st->compositor = wl_registry_bind(registry, name, &wl_compositor_interface,
                                           BIND_VERSION(4));
-    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+        if (st->compositor) {
+            st->compositor_name = name;
+        }
+    } else if (strcmp(interface, wl_shm_interface.name) == 0 && !st->shm) {
         st->shm = wl_registry_bind(registry, name, &wl_shm_interface, BIND_VERSION(1));
-    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        if (st->shm) {
+            st->shm_name = name;
+        }
+    } else if (strcmp(interface, wl_seat_interface.name) == 0 && !st->seat) {
+        /* One seat owns the single pointer/keyboard state. */
         st->seat = wl_registry_bind(registry, name, &wl_seat_interface, BIND_VERSION(1));
-        wl_seat_add_listener(st->seat, &freerange_seat_listener, st);
+        if (st->seat) {
+            st->seat_name = name;
+            wl_seat_add_listener(st->seat, &freerange_seat_listener, st);
+        }
     } else if (strcmp(interface, wl_output_interface.name) == 0 && !st->output) {
         /* Only the first. Poingo tracks a single output, and letting each new
            one overwrite it leaked the previous proxy and made the mode report
@@ -5087,20 +5144,75 @@ static void freerange_registry_global(void *data, struct wl_registry *registry,
            mixed-refresh desktop. */
         st->output = wl_registry_bind(registry, name, &wl_output_interface,
                                       BIND_VERSION(2));
-        wl_output_add_listener(st->output, &freerange_output_listener, st);
-    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        if (st->output) {
+            st->output_name = name;
+            wl_output_add_listener(st->output, &freerange_output_listener, st);
+        }
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0 && !st->wm_base) {
         st->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface,
                                        BIND_VERSION(1));
-        xdg_wm_base_add_listener(st->wm_base, &freerange_wm_base_listener, st);
+        if (st->wm_base) {
+            st->wm_base_name = name;
+            xdg_wm_base_add_listener(st->wm_base, &freerange_wm_base_listener, st);
+        }
     }
 
     #undef BIND_VERSION
 }
 
 static void freerange_registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)data;
     (void)registry;
-    (void)name;
+    FreedomState *st = data;
+    if (!st) {
+        return;
+    }
+
+    if (name == st->seat_name) {
+        if (st->pointer) {
+            wl_pointer_destroy(st->pointer);
+            st->pointer = NULL;
+        }
+        if (st->keyboard) {
+            wl_keyboard_destroy(st->keyboard);
+            st->keyboard = NULL;
+        }
+        if (st->seat) {
+            wl_seat_destroy(st->seat);
+            st->seat = NULL;
+        }
+        st->seat_name = FREERANGE_GLOBAL_NONE;
+        freerange_clear_held_keys(st);
+        freerange_clear_pointer(st);
+        return;
+    }
+    if (name == st->output_name) {
+        if (st->output) {
+            wl_output_destroy(st->output);
+            st->output = NULL;
+        }
+        st->output_name = FREERANGE_GLOBAL_NONE;
+        st->refresh_mhz = 0;
+        return;
+    }
+    if (name == st->shm_name) {
+        if (st->shm) {
+            wl_shm_destroy(st->shm);
+            st->shm = NULL;
+        }
+        st->shm_name = FREERANGE_GLOBAL_NONE;
+        return;
+    }
+    if (name == st->compositor_name) {
+        /* Its surfaces must die before the proxy. */
+        st->compositor_name = FREERANGE_GLOBAL_NONE;
+        st->running = false;
+        return;
+    }
+    if (name == st->wm_base_name) {
+        /* Destroying this with xdg_surfaces alive is a protocol error. */
+        st->wm_base_name = FREERANGE_GLOBAL_NONE;
+        st->running = false;
+    }
 }
 
 static const struct wl_registry_listener freerange_registry_listener = {
@@ -5119,12 +5231,16 @@ typedef struct {
     bool     ready;
     uint32_t compositor_ms;   
     uint64_t delivery_ns;     
+    struct wl_callback *callback;
 } FrameCbData;
 
 static void wayland_frame_done(void *data, struct wl_callback *callback, uint32_t time) {
     struct timespec _ts;
     clock_gettime(CLOCK_MONOTONIC, &_ts);
     FrameCbData *fcb = (FrameCbData *)data;
+    if (fcb->callback == callback) {
+        fcb->callback = NULL;
+    }
     fcb->delivery_ns  = (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
     fcb->ready        = true;
     fcb->compositor_ms = time;
@@ -5134,6 +5250,39 @@ static void wayland_frame_done(void *data, struct wl_callback *callback, uint32_
 static const struct wl_callback_listener wayland_frame_listener = {
     .done = wayland_frame_done
 };
+
+/* Hidden surfaces may withhold a callback indefinitely. */
+static bool wayland_frame_can_request(const FrameCbData *fcb) {
+    return fcb && !fcb->callback;
+}
+
+static bool wayland_frame_request(struct wl_surface *surface, FrameCbData *fcb) {
+    if (!surface || !wayland_frame_can_request(fcb)) {
+        return false;
+    }
+
+    struct wl_callback *callback = wl_surface_frame(surface);
+    if (!callback) {
+        return false;
+    }
+    if (wl_callback_add_listener(callback, &wayland_frame_listener, fcb) < 0) {
+        wl_callback_destroy(callback);
+        return false;
+    }
+
+    fcb->callback = callback;
+    fcb->ready = false;
+    return true;
+}
+
+static void wayland_frame_cancel(FrameCbData *fcb) {
+    if (!fcb || !fcb->callback) {
+        return;
+    }
+
+    wl_callback_destroy(fcb->callback);
+    fcb->callback = NULL;
+}
 
 
 /* The menu's on-screen box: ring[] is the ring proper, full[] takes in the
@@ -5161,6 +5310,93 @@ static bool poingo_menu_rects(int ring[4], int full[4]) {
     }
     full[0] = mx; full[1] = my; full[2] = mw; full[3] = mh;
     return true;
+}
+
+/* Release menu CPU and GL storage through one path. */
+static void poingo_menu_destroy(void) {
+    if (g_menu_tex) {
+        glDeleteTextures(1, &g_menu_tex);
+        g_menu_tex = 0;
+    }
+    if (g_menu) {
+        ringmenu_destroy(g_menu);
+        g_menu = NULL;
+    }
+    free(g_menu_scratch);
+    g_menu_scratch = NULL;
+    g_menu_scratch_cap = 0;
+
+    for (int i = 0; i < FIELD_CACHE_SLOTS; i++) {
+        free(g_field_cache[i].px);
+        g_field_cache[i].px = NULL;
+        g_field_cache[i].cap = 0;
+        g_field_cache[i].slot = -1;
+    }
+    free(g_upload_staging);
+    g_upload_staging = NULL;
+    g_upload_cap = 0;
+    g_menu_tex_w = 0;
+    g_menu_tex_h = 0;
+    g_menu_full_upload = true;
+    g_menu_tex_slot = -1;
+    g_menu_was_open = false;
+    g_picker_slot = -1;
+    g_picker_locked = false;
+    g_ring_right_release_pending = false;
+    g_ring_pointer_left_pending = false;
+    g_ring_deferred_st = NULL;
+}
+
+/* Destroy bound globals before disconnecting their display. */
+static void freerange_globals_destroy(FreedomState *st) {
+    if (!st) {
+        return;
+    }
+
+    if (st->pointer) {
+        wl_pointer_destroy(st->pointer);
+        st->pointer = NULL;
+    }
+    if (st->keyboard) {
+        wl_keyboard_destroy(st->keyboard);
+        st->keyboard = NULL;
+    }
+    if (st->seat) {
+        wl_seat_destroy(st->seat);
+        st->seat = NULL;
+    }
+    if (st->output) {
+        wl_output_destroy(st->output);
+        st->output = NULL;
+    }
+    if (st->wm_base) {
+        xdg_wm_base_destroy(st->wm_base);
+        st->wm_base = NULL;
+    }
+    if (st->shm) {
+        wl_shm_destroy(st->shm);
+        st->shm = NULL;
+    }
+    if (st->compositor) {
+        wl_compositor_destroy(st->compositor);
+        st->compositor = NULL;
+    }
+    if (st->registry) {
+        wl_registry_destroy(st->registry);
+        st->registry = NULL;
+    }
+    if (st->display) {
+        wl_display_disconnect(st->display);
+        st->display = NULL;
+    }
+
+    st->compositor_name = FREERANGE_GLOBAL_NONE;
+    st->shm_name = FREERANGE_GLOBAL_NONE;
+    st->seat_name = FREERANGE_GLOBAL_NONE;
+    st->output_name = FREERANGE_GLOBAL_NONE;
+    st->wm_base_name = FREERANGE_GLOBAL_NONE;
+    freerange_clear_held_keys(st);
+    freerange_clear_pointer(st);
 }
 
 static int run_freerange_wayland(bool start_muted) {
@@ -5195,7 +5431,7 @@ static int run_freerange_wayland(bool start_muted) {
     st.registry = wl_display_get_registry(st.display);
     if (!st.registry) {
         fprintf(stderr, "Failed to get Wayland registry\n");
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5207,7 +5443,7 @@ static int run_freerange_wayland(bool start_muted) {
 
     if (!st.compositor || !st.wm_base) {
         fprintf(stderr, "Wayland compositor/wm_base missing\n");
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5219,7 +5455,7 @@ static int run_freerange_wayland(bool start_muted) {
     st.egl_display = eglGetDisplay((EGLNativeDisplayType)st.display);
     if (st.egl_display == EGL_NO_DISPLAY || !eglInitialize(st.egl_display, NULL, NULL)) {
         fprintf(stderr, "Failed to initialize EGL\n");
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
     eglBindAPI(EGL_OPENGL_ES_API);
@@ -5238,7 +5474,7 @@ static int run_freerange_wayland(bool start_muted) {
     if (!eglChooseConfig(st.egl_display, egl_attr, &egl_cfg, 1, &egl_num) || egl_num < 1) {
         fprintf(stderr, "Failed to choose EGL config\n");
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5247,7 +5483,7 @@ static int run_freerange_wayland(bool start_muted) {
     if (st.egl_context == EGL_NO_CONTEXT) {
         fprintf(stderr, "Failed to create EGL context\n");
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5266,7 +5502,7 @@ static int run_freerange_wayland(bool start_muted) {
     if (!init_audio(start_muted)) {
         eglDestroyContext(st.egl_display, st.egl_context);
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5274,10 +5510,11 @@ static int run_freerange_wayland(bool start_muted) {
     if (!make_basis_frames(&frames, frame_count, angle_period)) {
         fprintf(stderr, "Failed to generate ball frames\n");
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
         eglDestroyContext(st.egl_display, st.egl_context);
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
     st.frames_ref = &frames;
@@ -5287,10 +5524,11 @@ static int run_freerange_wayland(bool start_muted) {
         fprintf(stderr, "Failed to create Wayland surface\n");
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
         eglDestroyContext(st.egl_display, st.egl_context);
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5303,13 +5541,15 @@ static int run_freerange_wayland(bool start_muted) {
     st.xdg_surface = xdg_wm_base_get_xdg_surface(st.wm_base, st.surface);
     if (!st.xdg_surface) {
         fprintf(stderr, "Failed to create xdg_surface\n");
+        ball_cursor_destroy();
         wl_surface_destroy(st.surface);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
         eglDestroyContext(st.egl_display, st.egl_context);
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5317,14 +5557,16 @@ static int run_freerange_wayland(bool start_muted) {
     st.xdg_toplevel = xdg_surface_get_toplevel(st.xdg_surface);
     if (!st.xdg_toplevel) {
         fprintf(stderr, "Failed to create xdg_toplevel\n");
+        ball_cursor_destroy();
         xdg_surface_destroy(st.xdg_surface);
         wl_surface_destroy(st.surface);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
         eglDestroyContext(st.egl_display, st.egl_context);
         eglTerminate(st.egl_display);
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
     xdg_toplevel_add_listener(st.xdg_toplevel, &freerange_toplevel_listener, &st);
@@ -5335,6 +5577,7 @@ static int run_freerange_wayland(bool start_muted) {
     st.egl_window = wl_egl_window_create(st.surface, st.width, st.height);
     if (!st.egl_window) {
         fprintf(stderr, "Failed to create EGL window\n");
+        ball_cursor_destroy();
         xdg_toplevel_destroy(st.xdg_toplevel);
         xdg_surface_destroy(st.xdg_surface);
         wl_surface_destroy(st.surface);
@@ -5342,8 +5585,9 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5351,6 +5595,7 @@ static int run_freerange_wayland(bool start_muted) {
                                             (EGLNativeWindowType)st.egl_window, NULL);
     if (st.egl_surface == EGL_NO_SURFACE) {
         fprintf(stderr, "Failed to create EGL window surface\n");
+        ball_cursor_destroy();
         wl_egl_window_destroy(st.egl_window);
         xdg_toplevel_destroy(st.xdg_toplevel);
         xdg_surface_destroy(st.xdg_surface);
@@ -5359,13 +5604,15 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
     if (!eglMakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context)) {
         fprintf(stderr, "Failed to make EGL context current\n");
+        ball_cursor_destroy();
         eglDestroySurface(st.egl_display, st.egl_surface);
         wl_egl_window_destroy(st.egl_window);
         xdg_toplevel_destroy(st.xdg_toplevel);
@@ -5375,8 +5622,9 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
     eglSwapInterval(st.egl_display, 0);
@@ -5456,6 +5704,8 @@ static int run_freerange_wayland(bool start_muted) {
     }
     if (!st.configured) {
         fprintf(stderr, "Never received the initial xdg_surface configure\n");
+        poingo_menu_destroy();
+        ball_cursor_destroy();
         eglDestroySurface(st.egl_display, st.egl_surface);
         wl_egl_window_destroy(st.egl_window);
         xdg_toplevel_destroy(st.xdg_toplevel);
@@ -5465,8 +5715,9 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5478,7 +5729,9 @@ static int run_freerange_wayland(bool start_muted) {
 
     if (!freerange_gl_init(&st, &frames)) {
         fprintf(stderr, "Failed to initialize GL resources\n");
+        poingo_menu_destroy();
         freerange_gl_shutdown(&st);
+        ball_cursor_destroy();
         eglDestroySurface(st.egl_display, st.egl_surface);
         wl_egl_window_destroy(st.egl_window);
         xdg_toplevel_destroy(st.xdg_toplevel);
@@ -5488,8 +5741,9 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
         freerange_color_regen_shutdown(&st);
         freerange_destroy_frames(&frames);
+        release_sphere_pixel_cache();
         shutdown_audio();
-        wl_display_disconnect(st.display);
+        freerange_globals_destroy(&st);
         return 1;
     }
 
@@ -5963,9 +6217,7 @@ static int run_freerange_wayland(bool start_muted) {
                 has_prev_compositor_ms = true;
             }
 
-            struct wl_callback *callback = wl_surface_frame(st.surface);
-            wl_callback_add_listener(callback, &wayland_frame_listener, &fr_cb);
-            fr_cb.ready = false;
+            (void)wayland_frame_request(st.surface, &fr_cb);
 
             float render_extrap_dt = (float)(TARGET_FRAME_SECONDS - sim_delta);
             float extrap_cap = (float)(SNAP_THRESHOLD * 4.0);
@@ -6417,10 +6669,10 @@ static int run_freerange_wayland(bool start_muted) {
 
         } else {
             if (++obscured_frames % 300 == 0) {
-                struct wl_callback *callback = wl_surface_frame(st.surface);
-                wl_callback_add_listener(callback, &wayland_frame_listener, &fr_cb);
-                wl_surface_commit(st.surface);
-                wl_display_flush(st.display);
+                if (wayland_frame_request(st.surface, &fr_cb)) {
+                    wl_surface_commit(st.surface);
+                    wl_display_flush(st.display);
+                }
             }
         }
     } 
@@ -6467,6 +6719,8 @@ static int run_freerange_wayland(bool start_muted) {
         fclose(fcb_log);
     }
 
+    wayland_frame_cancel(&fr_cb);
+    poingo_menu_destroy();
     freerange_gl_shutdown(&st);
     if (st.egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(st.egl_display, st.egl_surface);
@@ -6481,24 +6735,9 @@ static int run_freerange_wayland(bool start_muted) {
         eglTerminate(st.egl_display);
     }
 
-    /* Owns a wl_surface and wl_buffers, so it has to go before the compositor
-     * and shm that made them -- and well before wl_display_disconnect, which
-     * frees every proxy on the connection. Destroying them afterwards is a
-     * use-after-free, and it segfaulted on every single exit. */
+    /* Its surface and buffers must die before their globals and display. */
     ball_cursor_destroy();
 
-    if (st.pointer) {
-        wl_pointer_destroy(st.pointer);
-    }
-    if (st.keyboard) {
-        wl_keyboard_destroy(st.keyboard);
-    }
-    if (st.seat) {
-        wl_seat_destroy(st.seat);
-    }
-    if (st.output) {
-        wl_output_destroy(st.output);
-    }
     if (st.xdg_toplevel) {
         xdg_toplevel_destroy(st.xdg_toplevel);
     }
@@ -6508,33 +6747,11 @@ static int run_freerange_wayland(bool start_muted) {
     if (st.surface) {
         wl_surface_destroy(st.surface);
     }
-    if (st.wm_base) {
-        xdg_wm_base_destroy(st.wm_base);
-    }
-    if (st.shm) {
-        wl_shm_destroy(st.shm);
-    }
-    if (st.compositor) {
-        wl_compositor_destroy(st.compositor);
-    }
-    if (st.registry) {
-        wl_registry_destroy(st.registry);
-    }
-    if (st.display) {
-        wl_display_disconnect(st.display);
-    }
+    freerange_globals_destroy(&st);
 
     freerange_color_regen_shutdown(&st);
     freerange_destroy_frames(&frames);
     shutdown_audio();
-    if (g_menu) { ringmenu_destroy(g_menu); g_menu = NULL; }
-    if (g_menu_scratch) { free(g_menu_scratch); g_menu_scratch = NULL; }
-    for (int i = 0; i < FIELD_CACHE_SLOTS; i++) {
-        free(g_field_cache[i].px);
-        g_field_cache[i].px = NULL;
-        g_field_cache[i].cap = 0;
-    }
-    if (g_upload_staging) { free(g_upload_staging); g_upload_staging = NULL; g_upload_cap = 0; }
     free(st.regen_unit_done_storage);
     free(st.regen_order_storage);
     free(st.regen_thread_storage);

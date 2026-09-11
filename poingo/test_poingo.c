@@ -311,6 +311,8 @@ static void test_cli_rejects_bad_input(void) {
     CHECK(parse("--start-size", NULL) == POINGO_ARGS_ERROR, "--start-size with no value accepted");
     CHECK(parse("--light-color", NULL) == POINGO_ARGS_ERROR, "--light-color with no value accepted");
     CHECK(parse("--dark-color", NULL) == POINGO_ARGS_ERROR, "--dark-color with no value accepted");
+    CHECK(parse("--light-color", "1,2,3junk") == POINGO_ARGS_ERROR,
+          "--light-color accepted a trailing suffix");
     CHECK(parse("--start-szie", "1.0") == POINGO_ARGS_ERROR, "unknown option accepted");
     CHECK(parse("garbage", NULL) == POINGO_ARGS_ERROR, "stray operand accepted");
 
@@ -349,6 +351,105 @@ static void test_keyboard_leave_clears_keys(void) {
     CHECK(!st.key_vol_down_pressed, "vol down still held after focus loss");
     CHECK(!st.key_speed_up_pressed, "speed up still held after focus loss");
     CHECK(!st.key_speed_down_pressed, "speed down still held after focus loss");
+}
+
+/* A vanished pointer cannot deliver the release that ends a grab. */
+static void test_pointer_loss_releases_grab(void) {
+    FreedomState st = {
+        .pointer_down = true,
+        .grabbed_ball = 0,
+    };
+
+    freerange_seat_capabilities(&st, NULL, 0);
+
+    CHECK(!st.pointer_down, "pointer stayed down after capability loss");
+    CHECK(st.grabbed_ball == -1, "ball stayed grabbed after capability loss");
+}
+
+/* A hidden surface must keep at most one outstanding frame callback. */
+static void test_frame_callback_single_flight(void) {
+    FrameCbData callback = {0};
+    CHECK(wayland_frame_can_request(&callback), "first callback was blocked");
+
+    callback.callback = (struct wl_callback *)&callback;
+    CHECK(!wayland_frame_can_request(&callback), "duplicate callback was allowed");
+}
+
+/* Removed globals must release their slot for replacement devices. */
+static void test_registry_remove_clears_slots(void) {
+    enum {
+        TEST_SEAT_NAME = 17,
+        TEST_OUTPUT_NAME = 23,
+        TEST_COMPOSITOR_NAME = 29,
+        TEST_WM_BASE_NAME = 31,
+    };
+    FreedomState st = {
+        .seat_name = TEST_SEAT_NAME,
+        .output_name = TEST_OUTPUT_NAME,
+        .compositor_name = TEST_COMPOSITOR_NAME,
+        .wm_base_name = TEST_WM_BASE_NAME,
+        .key_vol_up_pressed = true,
+        .running = true,
+    };
+
+    freerange_registry_global_remove(&st, NULL, TEST_OUTPUT_NAME);
+    CHECK(st.output_name == FREERANGE_GLOBAL_NONE,
+          "removed output kept its registry slot");
+
+    freerange_registry_global_remove(&st, NULL, TEST_SEAT_NAME);
+    CHECK(st.seat_name == FREERANGE_GLOBAL_NONE,
+          "removed seat kept its registry slot");
+    CHECK(!st.key_vol_up_pressed, "removed seat kept held keys");
+
+    st.compositor = (struct wl_compositor *)&st;
+    freerange_registry_global_remove(&st, NULL, TEST_COMPOSITOR_NAME);
+    CHECK(st.compositor != NULL, "removed compositor destroyed before its surfaces");
+    CHECK(!st.running, "removed compositor left the client running");
+
+    st.running = true;
+    st.wm_base = (struct xdg_wm_base *)&st;
+    freerange_registry_global_remove(&st, NULL, TEST_WM_BASE_NAME);
+    CHECK(st.wm_base != NULL, "removed wm_base destroyed before its surfaces");
+    CHECK(!st.running, "removed wm_base left the client running");
+
+    st.compositor = NULL;
+    st.wm_base = NULL;
+}
+
+/* A failed cursor build must discard its published local storage. */
+static void test_cursor_failure_cleans_storage(void) {
+    const size_t map_size = 4096;
+    void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(map != MAP_FAILED, "cursor test mmap failed");
+    if (map == MAP_FAILED) {
+        return;
+    }
+
+    g_ball_cursor.map = map;
+    g_ball_cursor.map_size = map_size;
+    g_ball_cursor.blade = malloc(16);
+    CHECK(g_ball_cursor.blade != NULL, "cursor test allocation failed");
+
+    CHECK(!ball_cursor_fail(), "cursor failure reported success");
+    CHECK(g_ball_cursor.map == NULL, "cursor map survived failure");
+    CHECK(g_ball_cursor.blade == NULL, "cursor bitmap survived failure");
+}
+
+/* Menu teardown owns every global workspace. */
+static void test_menu_cleanup_releases_storage(void) {
+    g_menu_scratch = malloc(16);
+    g_menu_scratch_cap = 4;
+    g_field_cache[0].px = malloc(16);
+    g_field_cache[0].cap = 4;
+    g_upload_staging = malloc(16);
+    g_upload_cap = 4;
+
+    poingo_menu_destroy();
+
+    CHECK(g_menu_scratch == NULL, "menu workspace survived cleanup");
+    CHECK(g_field_cache[0].px == NULL, "field cache survived cleanup");
+    CHECK(g_upload_staging == NULL, "upload staging survived cleanup");
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,6 +570,11 @@ int main(void) {
     test_targeted_ball_actions();
     test_cli_rejects_bad_input();
     test_keyboard_leave_clears_keys();
+    test_pointer_loss_releases_grab();
+    test_frame_callback_single_flight();
+    test_registry_remove_clears_slots();
+    test_cursor_failure_cleans_storage();
+    test_menu_cleanup_releases_storage();
     test_regen_shutdown_joins_workers();
     test_color_change_joins_before_palette();
     test_regen_survives_worker_failure();
