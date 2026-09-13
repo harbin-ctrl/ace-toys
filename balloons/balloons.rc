@@ -1,0 +1,3 @@
+/* Balloons' Windows resources. toy-platform loads icon 1 for the window;
+   Explorer and the Start menu shortcut take the first icon in the file. */
+1 ICON "balloons.ico"

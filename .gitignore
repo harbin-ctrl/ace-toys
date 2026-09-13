@@ -30,3 +30,10 @@ compile_commands.json
 **/AppDir/
 **/*.AppImage
 **/appimagetool
+
+# Windows builds: the executables, and the icon each toy generates.
+*.exe
+/*/*.ico
+
+# The Windows package staging tree; the zip itself lands beside the repository.
+/win-packaging/stage/

@@ -4,18 +4,27 @@
 # a parallel (make -jN) build correct and free of duplicate work.
 #
 
+# ccache and distcc are the Linux build setup; Windows calls the compiler directly.
 ifeq ($(origin CC),default)
+ifneq ($(OS)$(MSYSTEM),)
+CC := gcc
+else
 CC := ccache gcc
 endif
+endif
 ifeq ($(origin CXX),default)
+ifneq ($(OS)$(MSYSTEM),)
+CXX := g++
+else
 CXX := ccache g++
+endif
 endif
 CCACHE_PREFIX ?= distcc
 export CC CXX CCACHE_PREFIX
 
 # Shared libraries (built here; toys reference them as ../<name> siblings).
 # ace-packaging ships only assets + install.mk, so it is not built.
-LIBS := toy-audio ring-menu third_party/lodepng shared
+LIBS := toy-audio toy-platform ring-menu third_party/lodepng shared
 
 # The interactive toys.
 TOYS := splat poingo balloons
@@ -30,7 +39,7 @@ LINT_SOURCES := \
 LINT_INCLUDES := -Itoy-audio -Iring-menu -Ishared -Isplat -Ipoingo -Iballoons -Ithird_party/lodepng
 TIDY_SOURCES := $(addprefix $(CURDIR)/,$(LINT_SOURCES))
 
-.PHONY: all libs clean install stage-install uninstall deb debs \
+.PHONY: all libs clean install stage-install uninstall deb debs package \
 	$(LIBS) $(TOYS) lint cppcheck analyzer tidy compile_commands.json
 
 all: $(TOYS)
@@ -57,11 +66,39 @@ deb:
 
 debs: deb
 
+ifneq ($(OS)$(MSYSTEM),)
+# Windows: the win-toys package, a zip beside the repository as the .deb is.
+# See win-packaging/README.md.
+WIN_VERSION := $(shell sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p' debian/changelog)
+WIN_ARCH := $(if $(filter aarch64,$(MSYSTEM_CARCH)),arm64,$(if $(filter x86_64,$(MSYSTEM_CARCH)),x64,$(MSYSTEM_CARCH)))
+WIN_PACKAGE := win-toys_$(WIN_VERSION)_$(WIN_ARCH)
+WIN_STAGE := $(CURDIR)/win-packaging/stage
+WIN_PACKAGE_DIR := $(WIN_STAGE)/$(WIN_PACKAGE)
+WIN_PACKAGE_ZIP := $(abspath $(CURDIR)/../$(WIN_PACKAGE).zip)
+WIN_POWERSHELL := powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File
+
+package: $(TOYS)
+	rm -rf "$(WIN_STAGE)"
+	@for d in $(TOYS); do $(MAKE) -C $$d stage DESTDIR="$(WIN_PACKAGE_DIR)" || exit $$?; done
+	cp win-packaging/install.ps1 win-packaging/install.cmd win-packaging/uninstall.cmd \
+		win-packaging/README.txt "$(WIN_PACKAGE_DIR)/"
+	rm -f "$(WIN_PACKAGE_ZIP)"
+	bsdtar -a -cf "$(WIN_PACKAGE_ZIP)" -C "$(WIN_STAGE)" "$(WIN_PACKAGE)"
+	@echo "package: $(WIN_PACKAGE_ZIP)"
+
+# Installs from the package, as Linux installs the .deb.
+install: package
+	$(WIN_POWERSHELL) "$$(cygpath -w "$(WIN_PACKAGE_DIR)/install.ps1")" -Action InstallAll
+
+uninstall:
+	@for d in $(TOYS); do $(MAKE) -C $$d uninstall || exit $$?; done
+else
 # --reinstall: a rebuild keeps its version, and apt skips an equal version.
 install: deb
 	@set -euo pipefail; \
 	package=../ace-toys_$$(dpkg-parsechangelog -SVersion)_$$(dpkg --print-architecture).deb; \
 	if [ "$$(id -u)" -eq 0 ]; then apt install -y --reinstall "$$package"; else sudo apt install -y --reinstall "$$package"; fi
+endif
 
 lint:
 	$(MAKE) cppcheck

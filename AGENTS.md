@@ -9,6 +9,9 @@ The repository is `ace-toys`.
   hand (`make -C <toy> install`) — it writes to `$PREFIX`, and that copy
   silently shadows the packaged one on `PATH`.
 
+- On Windows the package is `win-toys`: `make install` at the repository root,
+  in an MSYS2 CLANGARM64 shell, installs it per user. See `win-packaging`.
+
 - When writing something intended for human consumption, (comment, commit message, reply to prompt) use as few words as possible. Pick every word meticulously to reduce the volume to a strict minimum. Be down to the point. Less is more.
 
 - Avoid superlatives and praise. Stop telling me I am absolutely right. Give me the cold hard truth.

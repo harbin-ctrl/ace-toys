@@ -20,9 +20,10 @@ typedef struct {
 } ToyAudioStreamConfig;
 
 /*
- * Start a native PipeWire playback stream. All allocation and format setup
- * happens before this function returns; the process callback only renders
- * into PipeWire-owned mapped buffers.
+ * Start a native playback stream: PipeWire (toy_audio_stream.c) or WASAPI
+ * (toy_audio_stream_wasapi.c). All allocation and format setup happens
+ * before this function returns; the render callback only fills buffers the
+ * audio system owns.
  *
  * One channel negotiates MONO. Two channels negotiate explicit FL,FR stereo.
  */

@@ -6,30 +6,14 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <poll.h>
 #include <signal.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <pthread.h>
 
-#include <wayland-client.h>
-#include <wayland-egl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include "xdg-shell-client-protocol.h"
+#include "platform.h"
 #include "ringmenu.h"
 #include "ghost_icon.h"
-#include <linux/input-event-codes.h>
-
-#ifndef EGL_BUFFER_AGE_EXT
-#define EGL_BUFFER_AGE_EXT 0x313D
-#endif
-
-static PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC g_swap_damage;
-
-#include "xdg-shell-client-protocol.h"
-#include "ringmenu.h"
 #include "toy_audio.h"
 #include "toy_audio_stream.h"
 #include "spraycan.h"
@@ -109,32 +93,11 @@ typedef enum {
 #define SPLAT_SCRATCH_CAP ((size_t)SPLAT_SCRATCH_SIDE * SPLAT_SCRATCH_SIDE)
 
 typedef struct {
-    struct wl_display *display;
-    struct wl_registry *registry;
-    struct wl_compositor *compositor;
-    struct wl_shm *shm;
-    struct wl_seat *seat;
-    struct wl_pointer *pointer;
-    struct wl_keyboard *keyboard;
-    struct wl_output *output;
-    struct xdg_wm_base *wm_base;
-    struct wl_surface *surface;
-    struct xdg_surface *xdg_surface;
-    struct xdg_toplevel *xdg_toplevel;
+    Plat *plat;
 
-    struct wl_surface *cursor_surface;
-    struct wl_buffer *cursor_buffer;
-    void *cursor_map;
-    size_t cursor_map_size;
-    int cursor_hot_x;
-    int cursor_hot_y;
-    bool cursor_dirty;   
-
-    EGLDisplay egl_display;
-    EGLContext egl_context;
-    EGLConfig egl_config;
-    EGLSurface egl_surface;
-    struct wl_egl_window *egl_window;
+    int cursor;                 /* platform cursor id, -1 without one */
+    uint32_t *cursor_pixels;    /* redrawn when the tool, size or colour changes */
+    bool cursor_dirty;
 
     GLuint program;
     GLint pos_loc;
@@ -147,7 +110,6 @@ typedef struct {
     int height;
     int pending_width;
     int pending_height;
-    bool configured;
     bool resize_pending;
     bool running;
 
@@ -259,7 +221,7 @@ static struct {
 
 static int paint_threads(void) {
     if (g_pool.nthreads == 0) {
-        long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        long cores = plat_cpu_count();
         int n = (cores > 2) ? (int)cores - 2 + 1 : 1;
         if (n > PAINT_MAX_THREADS) n = PAINT_MAX_THREADS;
         g_pool.nthreads = n;
@@ -1261,7 +1223,7 @@ static bool hiss_start(void) {
     };
     g_hiss.stream = toy_audio_stream_start(&stream_config);
     if (!g_hiss.stream) {
-        fprintf(stderr, "Splat: failed to start PipeWire audio; quitting.\n");
+        fprintf(stderr, "Splat: failed to start audio; quitting.\n");
         return false;
     }
     g_hiss.running = true;
@@ -1574,48 +1536,20 @@ static void render_cursor(PaintState *st, uint32_t *px) {
 }
 
 static bool create_cursor(PaintState *st) {
-    if (!st->shm || !st->compositor) return false;
+    st->cursor = -1;
+    st->cursor_pixels = malloc((size_t)CURSOR_BUF * CURSOR_BUF * sizeof(*st->cursor_pixels));
+    if (!st->cursor_pixels) return false;
 
-    int stride = CURSOR_BUF * 4;
-    size_t bytes = (size_t)stride * CURSOR_BUF;
-    int fd = memfd_create("splat-cursor", MFD_CLOEXEC);
-    if (fd < 0) return false;
-    if (ftruncate(fd, (off_t)bytes) < 0) {
-        close(fd);
-        return false;
-    }
-    void *data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return false;
-    }
-
-    struct wl_shm_pool *pool = wl_shm_create_pool(st->shm, fd, (int32_t)bytes);
-    st->cursor_buffer = wl_shm_pool_create_buffer(pool, 0, CURSOR_BUF, CURSOR_BUF,
-                                                  stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
-
-    render_cursor(st, data);
-    st->cursor_map = data;
-    st->cursor_map_size = bytes;
-    st->cursor_hot_x = CURSOR_HOT;
-    st->cursor_hot_y = CURSOR_HOT;
-
-    st->cursor_surface = wl_compositor_create_surface(st->compositor);
-    if (!st->cursor_surface) return false;
-    wl_surface_attach(st->cursor_surface, st->cursor_buffer, 0, 0);
-    wl_surface_damage(st->cursor_surface, 0, 0, CURSOR_BUF, CURSOR_BUF);
-    wl_surface_commit(st->cursor_surface);
-    return true;
+    render_cursor(st, st->cursor_pixels);
+    st->cursor = plat_cursor_create(st->plat, st->cursor_pixels, CURSOR_BUF, 1,
+                                    CURSOR_HOT, CURSOR_HOT);
+    return st->cursor >= 0;
 }
 
 static void update_cursor(PaintState *st) {
-    if (!st->cursor_map || !st->cursor_surface) return;
-    render_cursor(st, st->cursor_map);
-    wl_surface_attach(st->cursor_surface, st->cursor_buffer, 0, 0);
-    wl_surface_damage(st->cursor_surface, 0, 0, CURSOR_BUF, CURSOR_BUF);
-    wl_surface_commit(st->cursor_surface);
+    if (st->cursor < 0) return;
+    render_cursor(st, st->cursor_pixels);
+    plat_cursor_update(st->plat, st->cursor, st->cursor_pixels);
 }
 
 
@@ -2099,110 +2033,42 @@ static void gl_draw(PaintState *st, bool repaint_full, int rx0, int ry0, int rx1
 
 
 static void update_input_region(PaintState *st) {
-    if (!st->compositor || !st->surface) return;
-    struct wl_region *region = wl_compositor_create_region(st->compositor);
-    if (!region) return;
-    if (st->paint_mode) {
-        wl_region_add(region, 0, 0, st->width, st->height);
-    } else {
-        int bx, by;
-        badge_pos(st, &bx, &by);
-        wl_region_add(region, bx, by, BADGE_SIZE, BADGE_SIZE);
+    if (!st->plat) return;
+    PlatRect region = { 0, 0, st->width, st->height };
+    if (!st->paint_mode) {
+        badge_pos(st, &region.x, &region.y);
+        region.w = BADGE_SIZE;
+        region.h = BADGE_SIZE;
     }
-    wl_surface_set_input_region(st->surface, region);
-    wl_region_destroy(region);
-    wl_surface_commit(st->surface);
+    plat_input_region(st->plat, &region, 1);
+    plat_apply(st->plat);
 }
 
 
-static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
-    (void)data;
-    xdg_wm_base_pong(wm_base, serial);
-}
-static const struct xdg_wm_base_listener wm_base_listener = {
-    .ping = wm_base_ping,
-};
-
-static void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
+static void on_resize(void *data, int width, int height) {
     PaintState *st = data;
-    xdg_surface_ack_configure(surface, serial);
-    st->configured = true;
-    if (st->pending_width > 0 && st->pending_height > 0 &&
-        (st->pending_width != st->width || st->pending_height != st->height)) {
+    st->pending_width = width;
+    st->pending_height = height;
+    if (width != st->width || height != st->height) {
         st->resize_pending = true;
     }
 }
-static const struct xdg_surface_listener xdg_surface_listener = {
-    .configure = xdg_surface_configure,
-};
-
-static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
-                               int32_t width, int32_t height, struct wl_array *states) {
-    (void)toplevel;
-    (void)states;
-    PaintState *st = data;
-    if (width > 0 && height > 0) {
-        st->pending_width = width;
-        st->pending_height = height;
-    }
-}
-static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
-    (void)toplevel;
+static void on_close(void *data) {
     ((PaintState *)data)->running = false;
 }
-static const struct xdg_toplevel_listener toplevel_listener = {
-    .configure = toplevel_configure,
-    .close = toplevel_close,
-};
 
-static void output_geometry(void *data, struct wl_output *o, int32_t x, int32_t y,
-                            int32_t pw, int32_t ph, int32_t sub,
-                            const char *make, const char *model, int32_t transform) {
-    (void)data; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub;
-    (void)make; (void)model; (void)transform;
-}
-static void output_mode(void *data, struct wl_output *o, uint32_t flags,
-                        int32_t width, int32_t height, int32_t refresh) {
-    (void)o; (void)refresh;
+static void pointer_enter(void *data, int x, int y) {
     PaintState *st = data;
-    if (flags & WL_OUTPUT_MODE_CURRENT) {
-        st->width = width;
-        st->height = height;
-    }
+    st->pointer_x = x;
+    st->pointer_y = y;
 }
-static void output_done(void *data, struct wl_output *o) { (void)data; (void)o; }
-static void output_scale(void *data, struct wl_output *o, int32_t f) { (void)data; (void)o; (void)f; }
-static const struct wl_output_listener output_listener = {
-    .geometry = output_geometry,
-    .mode = output_mode,
-    .done = output_done,
-    .scale = output_scale,
-};
-
-
-
-static void pointer_enter(void *data, struct wl_pointer *p, uint32_t serial,
-                          struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
-    (void)surface;
-    PaintState *st = data;
-    st->pointer_x = wl_fixed_to_int(sx);
-    st->pointer_y = wl_fixed_to_int(sy);
-    if (st->cursor_surface) {
-        wl_pointer_set_cursor(p, serial, st->cursor_surface,
-                              st->cursor_hot_x, st->cursor_hot_y);
-    }
-}
-static void pointer_leave(void *data, struct wl_pointer *p, uint32_t serial,
-                          struct wl_surface *surface) {
-    (void)p; (void)serial; (void)surface;
+static void pointer_leave(void *data) {
     ((PaintState *)data)->pointer_down = false;
 }
-static void pointer_motion(void *data, struct wl_pointer *p, uint32_t time,
-                           wl_fixed_t sx, wl_fixed_t sy) {
-    (void)p; (void)time;
+static void pointer_motion(void *data, int x, int y) {
     PaintState *st = data;
-    st->pointer_x = wl_fixed_to_int(sx);
-    st->pointer_y = wl_fixed_to_int(sy);
+    st->pointer_x = x;
+    st->pointer_y = y;
 
     if (ringmenu_is_open(st->menu)) {
         ringmenu_motion(st->menu, st->pointer_x, st->pointer_y);
@@ -2268,12 +2134,10 @@ static void pointer_motion(void *data, struct wl_pointer *p, uint32_t time,
         }
     }
 }
-static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
-                           uint32_t time, uint32_t button, uint32_t state) {
-    (void)p; (void)serial; (void)time;
+static void pointer_button(void *data, PlatButton button, PlatPress state) {
     PaintState *st = data;
     if (!st->paint_mode) {
-        if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (button == PLAT_BTN_LEFT && state == PLAT_PRESSED) {
             int bx, by;
             badge_pos(st, &bx, &by);
             if (st->pointer_x >= bx && st->pointer_x < bx + BADGE_SIZE &&
@@ -2286,11 +2150,11 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
 
     if (ringmenu_is_open(st->menu)) {
         int btn = -1;
-        if (button == BTN_LEFT) btn = RINGMENU_BTN_LEFT;
-        else if (button == BTN_RIGHT) btn = RINGMENU_BTN_RIGHT;
-        else if (button == BTN_MIDDLE) btn = RINGMENU_BTN_MIDDLE;
+        if (button == PLAT_BTN_LEFT) btn = RINGMENU_BTN_LEFT;
+        else if (button == PLAT_BTN_RIGHT) btn = RINGMENU_BTN_RIGHT;
+        else if (button == PLAT_BTN_MIDDLE) btn = RINGMENU_BTN_MIDDLE;
         if (btn >= 0) {
-            bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+            bool pressed = (state == PLAT_PRESSED);
             
             if (!pressed && st->color_picker_slot >= 0 && (btn == RINGMENU_BTN_LEFT || btn == RINGMENU_BTN_RIGHT)) {
                 int selected = st->color_picker_slot + 1;
@@ -2322,8 +2186,8 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
         return;
     }
 
-    if (button == BTN_RIGHT) {
-        if (state == WL_POINTER_BUTTON_STATE_PRESSED && st->menu) {
+    if (button == PLAT_BTN_RIGHT) {
+        if (state == PLAT_PRESSED && st->menu) {
             st->pointer_down = false;
             st->color_picker_slot = -1;
             st->color_picker_locked = false;
@@ -2334,9 +2198,9 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
         }
         return;
     }
-    if (button != BTN_LEFT) return;
+    if (button != PLAT_BTN_LEFT) return;
 
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (state == PLAT_PRESSED) {
         st->pointer_down = true;
         clock_gettime(CLOCK_MONOTONIC, &st->last_step);
         if (st->eraser_mode) {
@@ -2351,14 +2215,11 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
         st->has_last_splat = false;
     }
 }
-static void pointer_axis(void *data, struct wl_pointer *p, uint32_t time,
-                         uint32_t axis, wl_fixed_t value) {
-    (void)p; (void)time;
+static void pointer_scroll(void *data, double value) {
     PaintState *st = data;
-    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) return;
     if (!st->paint_mode || ringmenu_is_open(st->menu)) return;
 
-    double notches = wl_fixed_to_double(value) / 10.0;
+    double notches = value / 10.0;
     double factor = pow(SIZE_STEP, -notches);   
     if (st->eraser_mode) {
         st->eraser_radius *= factor;
@@ -2375,52 +2236,35 @@ static void pointer_axis(void *data, struct wl_pointer *p, uint32_t time,
     }
     st->cursor_dirty = true;
 }
-static const struct wl_pointer_listener pointer_listener = {
-    .enter = pointer_enter,
-    .leave = pointer_leave,
-    .motion = pointer_motion,
-    .button = pointer_button,
-    .axis = pointer_axis,
-};
+/* No release will follow a button held when the pointer went away. */
+static void pointer_lost(void *data) {
+    ((PaintState *)data)->pointer_down = false;
+}
 
-static void keyboard_keymap(void *data, struct wl_keyboard *k, uint32_t fmt, int fd, uint32_t size) {
-    (void)data; (void)k; (void)fmt; (void)size;
-    if (fd >= 0) close(fd);
-}
-static void keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial,
-                           struct wl_surface *surface, struct wl_array *keys) {
-    (void)data; (void)k; (void)serial; (void)surface; (void)keys;
-}
-static void keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial,
-                           struct wl_surface *surface) {
-    (void)data; (void)k; (void)serial; (void)surface;
-}
-static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial,
-                         uint32_t time, uint32_t key, uint32_t state) {
-    (void)k; (void)serial; (void)time;
+static void keyboard_key(void *data, PlatKey key, PlatPress state) {
     PaintState *st = data;
-    if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+    if (state != PLAT_PRESSED) return;
 
     switch (key) {
-        case KEY_ESC:
-        case KEY_Q:
+        case PLAT_KEY_ESC:
+        case PLAT_KEY_Q:
             st->running = false;
             break;
-        case KEY_C:
+        case PLAT_KEY_C:
             clear_canvas(st);
             break;
-        case KEY_E:
+        case PLAT_KEY_E:
             st->eraser_mode = !st->eraser_mode;
             st->cursor_dirty = true;
             break;
-        case KEY_T:
+        case PLAT_KEY_T:
             st->tool = st->tool == TOOL_SPRAY ? TOOL_SPLAT : TOOL_SPRAY;
             st->eraser_mode = false;
             st->cursor_dirty = true;
             break;
-        case KEY_LEFTBRACE:
-        case KEY_RIGHTBRACE: {
-            double f = key == KEY_RIGHTBRACE ? SIZE_STEP : 1.0 / SIZE_STEP;
+        case PLAT_KEY_LEFTBRACE:
+        case PLAT_KEY_RIGHTBRACE: {
+            double f = key == PLAT_KEY_RIGHTBRACE ? SIZE_STEP : 1.0 / SIZE_STEP;
             if (st->eraser_mode) {
                 st->eraser_radius *= f;
                 if (st->eraser_radius < ERASER_R_MIN) st->eraser_radius = ERASER_R_MIN;
@@ -2437,7 +2281,7 @@ static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial,
             st->cursor_dirty = true;
             break;
         }
-        case KEY_SPACE:
+        case PLAT_KEY_SPACE:
             if (ringmenu_is_open(st->menu)) {
                 menu_closed(st, ringmenu_button(st->menu,
                                                 RINGMENU_BTN_MIDDLE, true));
@@ -2445,144 +2289,30 @@ static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial,
             set_paint_mode(st, !st->paint_mode);
             break;
         default:
-            if (key >= KEY_1 && key < KEY_1 + (uint32_t)PALETTE_SIZE) {
-                st->palette_index = (int)(key - KEY_1);
+            if (key >= PLAT_KEY_1 && key < PLAT_KEY_1 + (int)PALETTE_SIZE) {
+                st->palette_index = (int)(key - PLAT_KEY_1);
                 st->eraser_mode = false;
                 st->cursor_dirty = true;
             }
             break;
     }
 }
-static void keyboard_modifiers(void *data, struct wl_keyboard *k, uint32_t serial,
-                               uint32_t d, uint32_t l, uint32_t lo, uint32_t g) {
-    (void)data; (void)k; (void)serial; (void)d; (void)l; (void)lo; (void)g;
+static void keyboard_lost(void *data) {
+    (void)data;
 }
-static void keyboard_repeat_info(void *data, struct wl_keyboard *k, int32_t rate, int32_t delay) {
-    (void)data; (void)k; (void)rate; (void)delay;
-}
-static const struct wl_keyboard_listener keyboard_listener = {
-    .keymap = keyboard_keymap,
-    .enter = keyboard_enter,
-    .leave = keyboard_leave,
+
+static const PlatHandlers g_handlers = {
+    .pointer_enter = pointer_enter,
+    .pointer_leave = pointer_leave,
+    .pointer_motion = pointer_motion,
+    .pointer_button = pointer_button,
+    .pointer_scroll = pointer_scroll,
+    .pointer_lost = pointer_lost,
     .key = keyboard_key,
-    .modifiers = keyboard_modifiers,
-    .repeat_info = keyboard_repeat_info,
+    .keyboard_lost = keyboard_lost,
+    .resize = on_resize,
+    .close = on_close,
 };
-
-static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
-    PaintState *st = data;
-    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !st->pointer) {
-        st->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(st->pointer, &pointer_listener, st);
-    }
-    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !st->keyboard) {
-        st->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(st->keyboard, &keyboard_listener, st);
-    }
-}
-static void seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data; (void)seat; (void)name;
-}
-static const struct wl_seat_listener seat_listener = {
-    .capabilities = seat_capabilities,
-    .name = seat_name,
-};
-
-static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
-                            const char *interface, uint32_t version) {
-    (void)version;
-    PaintState *st = data;
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        st->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
-    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        st->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        st->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
-        wl_seat_add_listener(st->seat, &seat_listener, st);
-    } else if (strcmp(interface, wl_output_interface.name) == 0) {
-        st->output = wl_registry_bind(registry, name, &wl_output_interface, 2);
-        wl_output_add_listener(st->output, &output_listener, st);
-    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-        st->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
-        xdg_wm_base_add_listener(st->wm_base, &wm_base_listener, st);
-    }
-}
-static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)data; (void)registry; (void)name;
-}
-static const struct wl_registry_listener registry_listener = {
-    .global = registry_global,
-    .global_remove = registry_global_remove,
-};
-
-
-static void pump_events(struct wl_display *display, int timeout_ms) {
-    while (wl_display_prepare_read(display) != 0) {
-        wl_display_dispatch_pending(display);
-    }
-    wl_display_flush(display);
-
-    struct pollfd pfd = {
-        .fd = wl_display_get_fd(display),
-        .events = POLLIN,
-        .revents = 0,
-    };
-    if (poll(&pfd, 1, timeout_ms) <= 0) {
-        wl_display_cancel_read(display);
-    } else {
-        wl_display_read_events(display);
-    }
-    wl_display_dispatch_pending(display);
-}
-
-static bool frame_ready = true;
-static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
-    (void)data; (void)time;
-    frame_ready = true;
-    wl_callback_destroy(callback);
-}
-static const struct wl_callback_listener frame_listener = {
-    .done = frame_done,
-};
-
-
-static bool egl_setup(PaintState *st) {
-    st->egl_display = eglGetDisplay((EGLNativeDisplayType)st->display);
-    if (st->egl_display == EGL_NO_DISPLAY || !eglInitialize(st->egl_display, NULL, NULL)) {
-        fprintf(stderr, "Failed to initialize EGL\n");
-        return false;
-    }
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    g_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)
-        eglGetProcAddress("eglSwapBuffersWithDamageEXT");
-    if (!g_swap_damage) {
-        g_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)
-            eglGetProcAddress("eglSwapBuffersWithDamageKHR");
-    }
-
-    EGLint attr[] = {
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_NONE
-    };
-    EGLint num = 0;
-    if (!eglChooseConfig(st->egl_display, attr, &st->egl_config, 1, &num) || num < 1) {
-        fprintf(stderr, "Failed to choose EGL config\n");
-        return false;
-    }
-    st->egl_context = eglCreateContext(st->egl_display, st->egl_config, EGL_NO_CONTEXT,
-                                       (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
-    if (st->egl_context == EGL_NO_CONTEXT) {
-        fprintf(stderr, "Failed to create EGL context\n");
-        return false;
-    }
-    return true;
-}
 
 int main(void) {
     PaintState st = {0};
@@ -2603,57 +2333,25 @@ int main(void) {
     signal(SIGTERM, handle_signal);
     alpha_lut_init();
 
-    st.display = wl_display_connect(NULL);
-    if (!st.display) {
-        fprintf(stderr, "Failed to connect to a Wayland display. "
-                        "Splat needs a running Wayland compositor.\n");
+    PlatConfig plat_config = {
+        .title = "Splat",
+        .app_id = "splat",
+        .log = PLAT_LOG_QUIET,
+        .damage = PLAT_DAMAGE_AUTO,
+    };
+    st.plat = plat_open(&plat_config, &g_handlers, &st);
+    if (!st.plat) return 1;
+
+    int output_width = 0, output_height = 0;
+    plat_output_size(st.plat, &output_width, &output_height);
+    if (output_width > 0 && output_height > 0) {
+        st.width = output_width;
+        st.height = output_height;
+    }
+    if (!plat_window_create(st.plat, st.width, st.height) ||
+        !plat_window_show(st.plat)) {
+        plat_close(st.plat);
         return 1;
-    }
-
-    st.registry = wl_display_get_registry(st.display);
-    wl_registry_add_listener(st.registry, &registry_listener, &st);
-    wl_display_roundtrip(st.display);   
-    if (st.output) {
-        wl_display_roundtrip(st.display); 
-    }
-
-    if (!st.compositor || !st.wm_base) {
-        fprintf(stderr, "Compositor is missing wl_compositor or xdg_wm_base\n");
-        return 1;
-    }
-
-    if (!egl_setup(&st)) return 1;
-
-    st.surface = wl_compositor_create_surface(st.compositor);
-    if (!st.surface) {
-        fprintf(stderr, "Failed to create surface\n");
-        return 1;
-    }
-    wl_surface_set_opaque_region(st.surface, NULL);
-
-    st.xdg_surface = xdg_wm_base_get_xdg_surface(st.wm_base, st.surface);
-    xdg_surface_add_listener(st.xdg_surface, &xdg_surface_listener, &st);
-    st.xdg_toplevel = xdg_surface_get_toplevel(st.xdg_surface);
-    xdg_toplevel_add_listener(st.xdg_toplevel, &toplevel_listener, &st);
-    xdg_toplevel_set_title(st.xdg_toplevel, "Splat");
-    xdg_toplevel_set_app_id(st.xdg_toplevel, "splat");
-    xdg_toplevel_set_maximized(st.xdg_toplevel);
-
-    st.egl_window = wl_egl_window_create(st.surface, st.width, st.height);
-    st.egl_surface = eglCreateWindowSurface(st.egl_display, st.egl_config,
-                                            (EGLNativeWindowType)st.egl_window, NULL);
-    if (st.egl_surface == EGL_NO_SURFACE ||
-        !eglMakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context)) {
-        fprintf(stderr, "Failed to create/bind EGL surface\n");
-        return 1;
-    }
-
-    wl_surface_commit(st.surface);
-    while (!st.configured) {
-        if (wl_display_dispatch(st.display) < 0) {
-            fprintf(stderr, "Wayland disconnected during setup\n");
-            return 1;
-        }
     }
 
     if (st.pending_width > 0 && st.pending_height > 0) {
@@ -2662,7 +2360,7 @@ int main(void) {
     }
     st.pending_width = st.pending_height = 0;
     st.resize_pending = false;
-    wl_egl_window_resize(st.egl_window, st.width, st.height, 0, 0);
+    plat_surface_resize(st.plat, st.width, st.height);
     glViewport(0, 0, st.width, st.height);
 
     if (!gl_init(&st) || !canvas_resize(&st, st.width, st.height)) {
@@ -2741,8 +2439,11 @@ int main(void) {
                          (SPRAY_R_MAX - SPRAY_R_MIN)));
 
         bool want_draw = (st.dirty || st.shade_pending || st.menu_dirty ||
-                          st.frame_pending || g_quit_fade > 0.0) && frame_ready;
-        pump_events(st.display, want_draw ? 0 : (animating ? 8 : -1));
+                          st.frame_pending || g_quit_fade > 0.0) &&
+                         plat_frame(st.plat)->ready;
+        if (!plat_pump(st.plat, want_draw ? 0 : (animating ? 8 : -1))) {
+            break;
+        }
 
         if (g_quit_requested == 1 || (!st.running && g_quit_fade == 0.0)) {
             st.running = true;
@@ -2755,9 +2456,10 @@ int main(void) {
             st.pending_width = st.pending_height = 0;
             st.resize_pending = false;
             if (nw != st.width || nh != st.height) {
-                wl_egl_window_resize(st.egl_window, nw, nh, 0, 0);
+                plat_surface_resize(st.plat, nw, nh);
                 glViewport(0, 0, nw, nh);
                 canvas_resize(&st, nw, nh);
+                st.damage_hist_depth = 0;
                 st.dirty = true;
                 update_input_region(&st);
             }
@@ -2818,13 +2520,12 @@ int main(void) {
         st.last_step = now;
 
         if ((st.dirty || st.shade_pending || st.menu_dirty ||
-             st.frame_pending || g_quit_fade > 0.0) && frame_ready) {
+             st.frame_pending || g_quit_fade > 0.0) &&
+            plat_frame(st.plat)->ready) {
             flush_pending_shade(&st);
             st.frame_pending = false;
 
-            struct wl_callback *cb = wl_surface_frame(st.surface);
-            wl_callback_add_listener(cb, &frame_listener, NULL);
-            frame_ready = false;
+            (void)plat_frame_request(st.plat);
 
             bool full_damage = st.menu_dirty || ringmenu_is_open(st.menu) || !st.paint_mode || g_quit_fade > 0.0;
             int dx = 0, dy = 0, dw = 0, dh = 0;
@@ -2853,8 +2554,8 @@ int main(void) {
 
             bool repaint_full = true;
             int rx0 = 0, ry0 = 0, rx1 = st.width, ry1 = st.height;
-            EGLint age = 0;
-            if (!full_damage && eglQuerySurface(st.egl_display, st.egl_surface, EGL_BUFFER_AGE_EXT, &age) &&
+            int age = plat_buffer_age(st.plat);
+            if (!full_damage &&
                 age >= 1 && age <= st.damage_hist_depth) {
                 repaint_full = false;
                 rx0 = st.width; ry0 = st.height; rx1 = 0; ry1 = 0;
@@ -2871,16 +2572,15 @@ int main(void) {
 
             gl_draw(&st, repaint_full, rx0, ry0, rx1, ry1);
 
-            if (g_swap_damage && !full_damage) {
-                EGLint damage[4] = { dx, st.height - dy - dh, dw, dh };
-                if (dw == 0 || dh == 0) {
-                    damage[0] = 0; damage[1] = 0; damage[2] = 1; damage[3] = 1;
+            if (plat_has_damage(st.plat) && !full_damage) {
+                PlatRect damage = { dx, dy, dw, dh };
+                if (damage.w == 0 || damage.h == 0) {
+                    damage = (PlatRect){ 0, 0, 1, 1 };
                 }
-                g_swap_damage(st.egl_display, st.egl_surface, damage, 1);
+                plat_swap(st.plat, &damage, 1);
             } else {
-                eglSwapBuffers(st.egl_display, st.egl_surface);
+                plat_swap(st.plat, NULL, 0);
             }
-            wl_display_flush(st.display);
         }
     }
 
@@ -2902,20 +2602,9 @@ int main(void) {
     free(st.splat_own);
     free(st.splat_vdist);
     free(st.splat_vlabel);
-    if (st.cursor_surface) wl_surface_destroy(st.cursor_surface);
-    if (st.cursor_buffer) wl_buffer_destroy(st.cursor_buffer);
-    if (st.cursor_map) munmap(st.cursor_map, st.cursor_map_size);
-    if (st.shm) wl_shm_destroy(st.shm);
+    free(st.cursor_pixels);
     if (st.canvas_texture) glDeleteTextures(1, &st.canvas_texture);
     if (st.program) glDeleteProgram(st.program);
-    eglMakeCurrent(st.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (st.egl_surface != EGL_NO_SURFACE) eglDestroySurface(st.egl_display, st.egl_surface);
-    if (st.egl_window) wl_egl_window_destroy(st.egl_window);
-    if (st.egl_context != EGL_NO_CONTEXT) eglDestroyContext(st.egl_display, st.egl_context);
-    if (st.egl_display != EGL_NO_DISPLAY) eglTerminate(st.egl_display);
-    if (st.xdg_toplevel) xdg_toplevel_destroy(st.xdg_toplevel);
-    if (st.xdg_surface) xdg_surface_destroy(st.xdg_surface);
-    if (st.surface) wl_surface_destroy(st.surface);
-    wl_display_disconnect(st.display);
+    plat_close(st.plat);
     return 0;
 }

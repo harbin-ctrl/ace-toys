@@ -11,16 +11,11 @@
 #include <signal.h>
 #include <pthread.h>
 #include <malloc.h>
-#include <sys/mman.h>
 
-#include <wayland-client.h>
-#include <wayland-egl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 
-#include "xdg-shell-client-protocol.h"
-#include "xdg-decoration-client-protocol.h"
+#include "compat.h"
+#include "platform.h"
 #include "balloon_gen.h"
 #include "ghost_icon.h"
 #include "audio.h"
@@ -138,16 +133,9 @@ static float frandf_sq(void) { float r = frandf(); return r * r; }
 
 static bool g_trace;
 
-#ifndef EGL_BUFFER_AGE_EXT
-#define EGL_BUFFER_AGE_EXT 0x313D
-#endif
-
-static PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC g_swap_damage;
-static EGLint *g_damage_rects;
 static bool g_full_damage = true;
-static bool g_has_buffer_age = false;
 
-typedef struct { int x, y, w, h; } Rect;
+typedef PlatRect Rect;
 
 static void rect_union(Rect *acc, const Rect *r) {
     if (!r || r->w <= 0 || r->h <= 0) return;
@@ -593,42 +581,19 @@ static void sprite_update(Sprite *s, Mode mode, float dt, float t,
 
 
 typedef struct {
-    struct wl_display *display;
-    struct wl_registry *registry;
-    struct wl_compositor *compositor;
-    struct xdg_wm_base *wm_base;
-    struct wl_seat *seat;
-    struct wl_pointer *pointer;
-    struct wl_keyboard *keyboard;
-    struct zxdg_decoration_manager_v1 *deco_mgr;
-    struct zxdg_toplevel_decoration_v1 *deco;
-
-    struct wl_surface *surface;
-    struct xdg_surface *xdg_surface;
-    struct xdg_toplevel *toplevel;
-
-    struct wl_egl_window *egl_window;
-    EGLDisplay egl_display;
-    EGLContext egl_context;
-    EGLSurface egl_surface;
+    Plat *plat;
+    /* Input region scratch: a body box per balloon, or one for menu or ghost. */
+    PlatRect *input_rects;
 
     int width, height;
-    bool configured;
+    bool resize_pending;
     bool running;
     bool need_redraw;
 
     double ptr_x, ptr_y;
 
-    struct wl_shm *shm;
-    struct wl_surface *cursor_surface;
-    struct wl_buffer *cursor_buffer;
-    void *cursor_map;
-    size_t cursor_map_size;
-    struct wl_surface *hand_cursor_surface;
-    struct wl_buffer *hand_cursor_buffer;
-    void *hand_cursor_map;
-    size_t hand_cursor_map_size;
-    uint32_t cursor_serial;
+    int needle_cursor;
+    int hand_cursor;
 } Ctx;
 
 static volatile sig_atomic_t g_signal_quit = 0;
@@ -639,54 +604,13 @@ static GLint g_fade_loc = -1;
 static GLint g_color_loc = -1;
 static void on_signal(int sig) { (void)sig; g_signal_quit = 1; }
 
-static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
-                            const char *iface, uint32_t version) {
+static void on_resize(void *data, int width, int height) {
     Ctx *ctx = data;
-    if (!strcmp(iface, wl_compositor_interface.name)) {
-        ctx->compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
-    } else if (!strcmp(iface, xdg_wm_base_interface.name)) {
-        ctx->wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
-    } else if (!strcmp(iface, wl_seat_interface.name)) {
-        ctx->seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
-    } else if (!strcmp(iface, zxdg_decoration_manager_v1_interface.name)) {
-        ctx->deco_mgr = wl_registry_bind(reg, name, &zxdg_decoration_manager_v1_interface, 1);
-    } else if (!strcmp(iface, wl_shm_interface.name)) {
-        ctx->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
-    }
-}
-static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
-    (void)data; (void)reg; (void)name;
-}
-static const struct wl_registry_listener registry_listener = {
-    registry_global, registry_global_remove
-};
-
-static void wm_base_ping(void *data, struct xdg_wm_base *wm, uint32_t serial) {
-    (void)data;
-    xdg_wm_base_pong(wm, serial);
-}
-static const struct xdg_wm_base_listener wm_base_listener = { wm_base_ping };
-
-static void xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial) {
-    Ctx *ctx = data;
-    xdg_surface_ack_configure(xs, serial);
-    ctx->configured = true;
+    ctx->width = width;
+    ctx->height = height;
+    ctx->resize_pending = true;
     g_full_damage = true;
-    if (ctx->egl_window && ctx->width > 0 && ctx->height > 0) {
-        wl_egl_window_resize(ctx->egl_window, ctx->width, ctx->height, 0, 0);
-    }
     ctx->need_redraw = true;
-}
-static const struct xdg_surface_listener xdg_surface_listener = { xdg_surface_configure };
-
-static void toplevel_configure(void *data, struct xdg_toplevel *tl,
-                               int32_t w, int32_t h, struct wl_array *states) {
-    (void)tl; (void)states;
-    Ctx *ctx = data;
-    if (w > 0 && h > 0) {
-        ctx->width = w;
-        ctx->height = h;
-    }
 }
 static Ctx *g_ctx;
 static Sprite *g_sprites;
@@ -766,7 +690,7 @@ static bool g_menu_was_open;
 
 enum { MENU_STORM = 1, MENU_GRAB, MENU_POP, MENU_POP_ALL, MENU_GHOST, MENU_QUIT };
 
-static void update_pointer_cursor(uint32_t serial);
+static void update_pointer_cursor(void);
 
 static void menu_result(int r) {
     if (r == MENU_STORM) {
@@ -782,20 +706,17 @@ static void menu_result(int r) {
             g_grab_index = -1;
         }
         g_interaction_mode = r == MENU_GRAB ? INTERACTION_GRAB : INTERACTION_POP;
-        update_pointer_cursor(g_ctx->cursor_serial);
+        update_pointer_cursor();
     }
     else if (r == MENU_POP_ALL) start_mass_pop(false);
     else if (r == MENU_GHOST) g_ghost = true;
     else if (r == MENU_QUIT) trigger_quit();
 }
 
-static void toplevel_close(void *data, struct xdg_toplevel *tl) {
-    (void)tl; (void)data;
+static void on_close(void *data) {
+    (void)data;
     trigger_quit();
 }
-static const struct xdg_toplevel_listener toplevel_listener = {
-    toplevel_configure, toplevel_close
-};
 
 static int sprite_hit(double px, double py) {
     for (int i = g_nsprites - 1; i >= 0; i--) {
@@ -896,109 +817,67 @@ static void render_hand_cursor(uint32_t *px, int size) {
     }
 }
 
+/* The grab cursor's hotspot, in its pixels. */
+#define HAND_HOT_X 9
+#define HAND_HOT_Y 7
+
 typedef void (*CursorRenderer)(uint32_t *pixels, int size);
 
-static bool create_cursor_surface(Ctx *ctx, const char *name,
-                                   CursorRenderer render,
-                                   struct wl_surface **surface_out,
-                                   struct wl_buffer **buffer_out,
-                                   void **map_out, size_t *map_size_out) {
-    if (!ctx->shm || !ctx->compositor) return false;
-
-    int stride = NEEDLE_SIZE * 4;
-    size_t bytes = (size_t)stride * NEEDLE_SIZE;
-    int fd = memfd_create(name, MFD_CLOEXEC);
-    if (fd < 0) return false;
-    if (ftruncate(fd, (off_t)bytes) < 0) { close(fd); return false; }
-    void *data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) { close(fd); return false; }
-
-    struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, fd, (int32_t)bytes);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(
-        pool, 0, NEEDLE_SIZE, NEEDLE_SIZE, stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
-
-    if (!buffer) {
-        munmap(data, bytes);
-        return false;
-    }
-    render(data, NEEDLE_SIZE);
-
-    struct wl_surface *surface = wl_compositor_create_surface(ctx->compositor);
-    if (!surface) {
-        wl_buffer_destroy(buffer);
-        munmap(data, bytes);
-        return false;
-    }
-    wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_damage(surface, 0, 0, NEEDLE_SIZE, NEEDLE_SIZE);
-    wl_surface_commit(surface);
-    *surface_out = surface;
-    *buffer_out = buffer;
-    *map_out = data;
-    *map_size_out = bytes;
-    return true;
+/* Renders one NEEDLE_SIZE square and hands it to the platform, which keeps
+   its own copy. Returns the cursor's id, or -1. */
+static int create_cursor(Ctx *ctx, CursorRenderer render, int hot_x, int hot_y) {
+    uint32_t *pixels = malloc((size_t)NEEDLE_SIZE * NEEDLE_SIZE * sizeof(*pixels));
+    if (!pixels) return -1;
+    render(pixels, NEEDLE_SIZE);
+    int cursor = plat_cursor_create(ctx->plat, pixels, NEEDLE_SIZE, 1, hot_x, hot_y);
+    free(pixels);
+    return cursor;
 }
 
 static bool create_needle_cursor(Ctx *ctx) {
-    return create_cursor_surface(ctx, "balloons-needle-cursor",
-                                 render_needle_cursor, &ctx->cursor_surface,
-                                 &ctx->cursor_buffer, &ctx->cursor_map,
-                                 &ctx->cursor_map_size);
+    ctx->needle_cursor = create_cursor(ctx, render_needle_cursor,
+                                       (int)NEEDLE_TIP, (int)NEEDLE_TIP);
+    return ctx->needle_cursor >= 0;
 }
 
 static bool create_hand_cursor(Ctx *ctx) {
-    return create_cursor_surface(ctx, "balloons-hand-cursor",
-                                 render_hand_cursor, &ctx->hand_cursor_surface,
-                                 &ctx->hand_cursor_buffer, &ctx->hand_cursor_map,
-                                 &ctx->hand_cursor_map_size);
+    ctx->hand_cursor = create_cursor(ctx, render_hand_cursor, HAND_HOT_X, HAND_HOT_Y);
+    return ctx->hand_cursor >= 0;
 }
 
-static void update_pointer_cursor(uint32_t serial) {
-    if (!g_ctx || !g_ctx->pointer || !serial) return;
-    struct wl_surface *surface = g_interaction_mode == INTERACTION_GRAB
-                                     ? g_ctx->hand_cursor_surface
-                                     : g_ctx->cursor_surface;
-    if (surface) {
-        int hot_x = g_interaction_mode == INTERACTION_GRAB ? 9 : (int)NEEDLE_TIP;
-        int hot_y = g_interaction_mode == INTERACTION_GRAB ? 7 : (int)NEEDLE_TIP;
-        wl_pointer_set_cursor(g_ctx->pointer, serial, surface, hot_x, hot_y);
-    }
+static void update_pointer_cursor(void) {
+    if (!g_ctx || !g_ctx->plat) return;
+    int cursor = g_interaction_mode == INTERACTION_GRAB
+                     ? g_ctx->hand_cursor
+                     : g_ctx->needle_cursor;
+    if (cursor >= 0) plat_cursor_use(g_ctx->plat, cursor);
 }
 
-static void pointer_enter(void *d, struct wl_pointer *p, uint32_t serial,
-                          struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
-    (void)d; (void)sf;
-    g_ctx->cursor_serial = serial;
-    g_ctx->ptr_x = wl_fixed_to_double(x);
-    g_ctx->ptr_y = wl_fixed_to_double(y);
-    (void)p;
-    update_pointer_cursor(serial);
+static void pointer_enter(void *d, int x, int y) {
+    (void)d;
+    g_ctx->ptr_x = x;
+    g_ctx->ptr_y = y;
     if (g_trace) fprintf(stderr, "[trace] enter %.0f,%.0f\n", g_ctx->ptr_x, g_ctx->ptr_y);
 }
-static void pointer_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *sf) {
-    (void)d; (void)p; (void)serial; (void)sf;
+static void pointer_leave(void *d) {
+    (void)d;
 }
 static void grabbed_follow_pointer(void) {
     Sprite *s = &g_sprites[g_grab_index];
     s->x = (float)g_ctx->ptr_x - s->grab_dx;
     s->y = (float)g_ctx->ptr_y - s->grab_dy;
 }
-static void pointer_motion(void *d, struct wl_pointer *p, uint32_t time,
-                           wl_fixed_t x, wl_fixed_t y) {
-    (void)d; (void)p; (void)time;
-    g_ctx->ptr_x = wl_fixed_to_double(x);
-    g_ctx->ptr_y = wl_fixed_to_double(y);
+static void pointer_motion(void *d, int x, int y) {
+    (void)d;
+    g_ctx->ptr_x = x;
+    g_ctx->ptr_y = y;
     if (g_grab_index >= 0) grabbed_follow_pointer();
     if (ringmenu_is_open(g_menu))
         ringmenu_motion(g_menu, (int)g_ctx->ptr_x, (int)g_ctx->ptr_y);
 }
-static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
-                           uint32_t time, uint32_t button, uint32_t state) {
-    (void)d; (void)p; (void)serial; (void)time;
-    bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
-    g_ctx->cursor_serial = serial;
+static void pointer_button(void *d, PlatButton button, PlatPress press) {
+    (void)d;
+    bool pressed = press == PLAT_PRESSED;
 
     if (g_ghost) {
         if (pressed) {
@@ -1009,8 +888,8 @@ static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
 
     if (g_menu && ringmenu_is_open(g_menu)) {
         int btn = -1;
-        if (button == 0x110) btn = RINGMENU_BTN_LEFT;        
-        else if (button == 0x111) btn = RINGMENU_BTN_RIGHT;  
+        if (button == PLAT_BTN_LEFT) btn = RINGMENU_BTN_LEFT;
+        else if (button == PLAT_BTN_RIGHT) btn = RINGMENU_BTN_RIGHT;
         if (btn >= 0) {
             int r = ringmenu_button(g_menu, btn, pressed);
             if (r >= 0) menu_result(r);
@@ -1018,12 +897,12 @@ static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
         return;
     }
 
-    if (button == 0x112) {
+    if (button == PLAT_BTN_MIDDLE) {
         /* Middle-click has no action outside the ring menu. */
         return;
     }
 
-    if (button == 0x110 && g_interaction_mode == INTERACTION_GRAB) {
+    if (button == PLAT_BTN_LEFT && g_interaction_mode == INTERACTION_GRAB) {
         if (pressed) {
             int hit = sprite_hit(g_ctx->ptr_x, g_ctx->ptr_y);
             if (hit >= 0 && !g_sprites[hit].popped) {
@@ -1057,7 +936,7 @@ static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
         }
         return;
     }
-    if (button == 0x111 && pressed) { 
+    if (button == PLAT_BTN_RIGHT && pressed) {
         if (g_menu) {
             ringmenu_set_led(g_menu, MENU_STORM - 1,
                              g_storm_active ? RINGMENU_LED_ON : RINGMENU_LED_OFF);
@@ -1074,7 +953,7 @@ static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
         }
         return;
     }
-    if (button != 0x110 || !pressed ||
+    if (button != PLAT_BTN_LEFT || !pressed ||
         g_interaction_mode != INTERACTION_POP) return;
 
     int hit = sprite_hit(g_ctx->ptr_x, g_ctx->ptr_y);
@@ -1083,84 +962,42 @@ static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial,
     if (hit >= 0 && !g_sprites[hit].popped)
         pop_sprite(&g_sprites[hit], (float)g_ctx->ptr_x, (float)g_ctx->ptr_y);
 }
-static void pointer_axis(void *d, struct wl_pointer *p, uint32_t time,
-                         uint32_t axis, wl_fixed_t value) {
-    (void)d; (void)p; (void)time; (void)axis; (void)value;
+static void pointer_scroll(void *d, double delta) {
+    (void)d; (void)delta;
 }
-static void pointer_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
-static void pointer_axis_source(void *d, struct wl_pointer *p, uint32_t s) { (void)d; (void)p; (void)s; }
-static void pointer_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) {
-    (void)d; (void)p; (void)t; (void)a;
+static void pointer_lost(void *d) {
+    (void)d;
 }
-static void pointer_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) {
-    (void)d; (void)p; (void)a; (void)v;
-}
-static const struct wl_pointer_listener pointer_listener = {
-    pointer_enter, pointer_leave, pointer_motion, pointer_button, pointer_axis,
-    pointer_frame, pointer_axis_source, pointer_axis_stop, pointer_axis_discrete
-};
-
-static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t fmt, int32_t fd, uint32_t size) {
-    (void)d; (void)k; (void)fmt; (void)size;
-    close(fd);
-}
-static void kb_enter(void *d, struct wl_keyboard *k, uint32_t serial,
-                     struct wl_surface *sf, struct wl_array *keys) {
-    (void)d; (void)k; (void)serial; (void)sf; (void)keys;
-}
-static void kb_leave(void *d, struct wl_keyboard *k, uint32_t serial, struct wl_surface *sf) {
-    (void)d; (void)k; (void)serial; (void)sf;
-}
-static void kb_key(void *d, struct wl_keyboard *k, uint32_t serial,
-                   uint32_t time, uint32_t key, uint32_t state) {
-    (void)d; (void)k; (void)serial; (void)time;
-    if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    if (key == 1  || key == 16 )
+static void key_press(void *d, PlatKey key, PlatPress press) {
+    (void)d;
+    if (press != PLAT_PRESSED) return;
+    if (key == PLAT_KEY_ESC || key == PLAT_KEY_Q)
         trigger_quit();
-    else if (key == 57 )
+    else if (key == PLAT_KEY_SPACE)
         g_ghost = !g_ghost;
-    else if (key == 50 )
+    else if (key == PLAT_KEY_M)
         toggle_master_mute();
-    else if (key == 103 )
+    else if (key == PLAT_KEY_UP)
         adjust_master_volume(0.05f);
-    else if (key == 108 )
+    else if (key == PLAT_KEY_DOWN)
         adjust_master_volume(-0.05f);
 }
-static void kb_modifiers(void *d, struct wl_keyboard *k, uint32_t serial,
-                         uint32_t dep, uint32_t lat, uint32_t lock, uint32_t grp) {
-    (void)d; (void)k; (void)serial; (void)dep; (void)lat; (void)lock; (void)grp;
+static void keyboard_lost(void *d) {
+    (void)d;
 }
-static void kb_repeat_info(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay) {
-    (void)d; (void)k; (void)rate; (void)delay;
-}
-static const struct wl_keyboard_listener keyboard_listener = {
-    kb_keymap, kb_enter, kb_leave, kb_key, kb_modifiers, kb_repeat_info
+
+static const PlatHandlers g_handlers = {
+    .pointer_enter = pointer_enter,
+    .pointer_leave = pointer_leave,
+    .pointer_motion = pointer_motion,
+    .pointer_button = pointer_button,
+    .pointer_scroll = pointer_scroll,
+    .pointer_lost = pointer_lost,
+    .key = key_press,
+    .keyboard_lost = keyboard_lost,
+    .resize = on_resize,
+    .close = on_close,
 };
-
-static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
-    Ctx *ctx = data;
-    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !ctx->pointer) {
-        ctx->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(ctx->pointer, &pointer_listener, ctx);
-    }
-    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !ctx->keyboard) {
-        ctx->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(ctx->keyboard, &keyboard_listener, ctx);
-    }
-}
-static void seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data; (void)seat; (void)name;
-}
-static const struct wl_seat_listener seat_listener = { seat_capabilities, seat_name };
-
-static void frame_done(void *data, struct wl_callback *cb, uint32_t time);
-static const struct wl_callback_listener frame_listener = { frame_done };
-static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
-    (void)time;
-    Ctx *ctx = data;
-    wl_callback_destroy(cb);
-    ctx->need_redraw = true;
-}
 
 
 static const char *vert_src =
@@ -1293,7 +1130,7 @@ int main(int argc, char **argv) {
     }
     startup_mark("startup jobs launched");
 
-    /* While those jobs run, continue with the independent Wayland/EGL setup
+    /* While those jobs run, continue with the independent window-system setup
      * below. They are joined before any generated pixels are uploaded. */
     Anim *anims = NULL;
     if (!startup_jobs.assets_ok && !assets_thread_started) {
@@ -1313,18 +1150,17 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    ctx.display = wl_display_connect(NULL);
-    if (!ctx.display) { fprintf(stderr, "apngo: no Wayland display\n"); return 1; }
-    ctx.registry = wl_display_get_registry(ctx.display);
-    wl_registry_add_listener(ctx.registry, &registry_listener, &ctx);
-    wl_display_roundtrip(ctx.display);
-    startup_mark("Wayland registry");
-    if (!ctx.compositor || !ctx.wm_base) {
-        fprintf(stderr, "apngo: compositor lacks wl_compositor/xdg_wm_base\n");
-        return 1;
-    }
-    xdg_wm_base_add_listener(ctx.wm_base, &wm_base_listener, &ctx);
-    if (ctx.seat) wl_seat_add_listener(ctx.seat, &seat_listener, &ctx);
+    ctx.needle_cursor = -1;
+    ctx.hand_cursor = -1;
+    PlatConfig plat_config = {
+        .title = "balloons",
+        .app_id = "balloons",
+        .log = g_trace ? PLAT_LOG_DEBUG : PLAT_LOG_QUIET,
+        .damage = getenv("APNGO_NO_DAMAGE") ? PLAT_DAMAGE_OFF : PLAT_DAMAGE_AUTO,
+    };
+    ctx.plat = plat_open(&plat_config, &g_handlers, &ctx);
+    if (!ctx.plat) return 1;
+    startup_mark("window system");
 
     if (audio_thread_started) pthread_join(audio_thread, NULL);
     if (assets_thread_started) pthread_join(assets_thread, NULL);
@@ -1351,70 +1187,22 @@ int main(int argc, char **argv) {
 
     startup_mark("external assets");
 
-    ctx.surface = wl_compositor_create_surface(ctx.compositor);
-    wl_surface_set_opaque_region(ctx.surface, NULL);
-
-    ctx.xdg_surface = xdg_wm_base_get_xdg_surface(ctx.wm_base, ctx.surface);
-    xdg_surface_add_listener(ctx.xdg_surface, &xdg_surface_listener, &ctx);
-    ctx.toplevel = xdg_surface_get_toplevel(ctx.xdg_surface);
-    xdg_toplevel_add_listener(ctx.toplevel, &toplevel_listener, &ctx);
-    xdg_toplevel_set_title(ctx.toplevel, "balloons");
-    xdg_toplevel_set_app_id(ctx.toplevel, "balloons");
-    xdg_toplevel_set_maximized(ctx.toplevel);
-
-    if (ctx.deco_mgr) {
-        ctx.deco =
-            zxdg_decoration_manager_v1_get_toplevel_decoration(ctx.deco_mgr, ctx.toplevel);
-        zxdg_toplevel_decoration_v1_set_mode(ctx.deco, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+    int output_w = 0, output_h = 0;
+    plat_output_size(ctx.plat, &output_w, &output_h);
+    if (output_w > 0 && output_h > 0) {
+        ctx.width = output_w;
+        ctx.height = output_h;
     }
-
-    wl_surface_commit(ctx.surface);
-    while (!ctx.configured && wl_display_dispatch(ctx.display) != -1) {}
-
-    ctx.egl_display = eglGetDisplay((EGLNativeDisplayType)ctx.display);
-    if (ctx.egl_display == EGL_NO_DISPLAY || !eglInitialize(ctx.egl_display, NULL, NULL)) {
-        fprintf(stderr, "apngo: EGL init failed\n");
+    if (!plat_window_create(ctx.plat, ctx.width, ctx.height) ||
+        !plat_window_show(ctx.plat)) {
+        plat_close(ctx.plat);
         return 1;
+    }
+    if (ctx.resize_pending) {
+        plat_surface_resize(ctx.plat, ctx.width, ctx.height);
+        ctx.resize_pending = false;
     }
     startup_mark("EGL initialized");
-    eglBindAPI(EGL_OPENGL_ES_API);
-    EGLint cfg_attr[] = {
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_NONE
-    };
-    EGLConfig cfg;
-    EGLint ncfg = 0;
-    if (!eglChooseConfig(ctx.egl_display, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) {
-        fprintf(stderr, "apngo: no ARGB EGL config\n");
-        return 1;
-    }
-    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    ctx.egl_context = eglCreateContext(ctx.egl_display, cfg, EGL_NO_CONTEXT, ctx_attr);
-    ctx.egl_window = wl_egl_window_create(ctx.surface, ctx.width, ctx.height);
-    ctx.egl_surface = eglCreateWindowSurface(ctx.egl_display, cfg,
-                                             (EGLNativeWindowType)ctx.egl_window, NULL);
-    if (ctx.egl_context == EGL_NO_CONTEXT || ctx.egl_surface == EGL_NO_SURFACE ||
-        !eglMakeCurrent(ctx.egl_display, ctx.egl_surface, ctx.egl_surface, ctx.egl_context)) {
-        fprintf(stderr, "apngo: EGL surface/context failed\n");
-        return 1;
-    }
-    eglSwapInterval(ctx.egl_display, 0); 
-
-    if (!getenv("APNGO_NO_DAMAGE")) {
-        const char *eglexts = eglQueryString(ctx.egl_display, EGL_EXTENSIONS);
-        if (eglexts) {
-            if (strstr(eglexts, "EGL_EXT_swap_buffers_with_damage"))
-                g_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)
-                    eglGetProcAddress("eglSwapBuffersWithDamageEXT");
-            else if (strstr(eglexts, "EGL_KHR_swap_buffers_with_damage"))
-                g_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)
-                    eglGetProcAddress("eglSwapBuffersWithDamageKHR");
-            
-            g_has_buffer_age = strstr(eglexts, "EGL_EXT_buffer_age") != NULL;
-        }
-    }
 
     GLuint prog = glCreateProgram();
     glAttachShader(prog, compile_shader(GL_VERTEX_SHADER, vert_src));
@@ -1469,6 +1257,7 @@ int main(int argc, char **argv) {
     if (!create_hand_cursor(&ctx)) {
         fprintf(stderr, "balloons: no hand cursor, using the default pointer\n");
     }
+    update_pointer_cursor();
 
     GLuint **anim_tex = calloc((size_t)nfiles, sizeof(GLuint *));
     if (!anim_tex) { fprintf(stderr, "out of memory\n"); return 1; }
@@ -1545,10 +1334,10 @@ int main(int argc, char **argv) {
     g_nsprites = count;
     g_sprites = calloc((size_t)g_nsprites, sizeof(Sprite));
     int max_damage = 2 * g_nsprites;   
-    g_damage_rects = calloc((size_t)max_damage * 4, sizeof(EGLint));
     g_cur_damage = calloc((size_t)max_damage, sizeof(Rect));
     g_sprite_rects = calloc((size_t)g_nsprites, sizeof(Rect));
-    bool dmg_ok = g_damage_rects && g_cur_damage && g_sprite_rects;
+    ctx.input_rects = calloc((size_t)g_nsprites + 1, sizeof(PlatRect));
+    bool dmg_ok = g_cur_damage && g_sprite_rects && ctx.input_rects;
     for (int i = 0; i < DAMAGE_HISTORY; i++) {
         g_damage_hist[i] = calloc((size_t)max_damage, sizeof(Rect));
         if (!g_damage_hist[i]) dmg_ok = false;
@@ -1562,9 +1351,7 @@ int main(int argc, char **argv) {
     startup_mark("scene initialized");
 
     if (g_ghost) {
-        struct wl_region *empty = wl_compositor_create_region(ctx.compositor);
-        wl_surface_set_input_region(ctx.surface, empty);
-        wl_region_destroy(empty);
+        plat_input_region(ctx.plat, NULL, 0);
     }
 
     if (getenv("BALLOONS_TEST_STORM")) start_storm();
@@ -1591,12 +1378,16 @@ int main(int argc, char **argv) {
             ctx.need_redraw = true;
         }
 
-        if (wl_display_dispatch_pending(ctx.display) == -1) break;
-        if (!ctx.need_redraw) {
-            if (wl_display_dispatch(ctx.display) == -1) break;
+        if (!plat_pump(ctx.plat, 0)) break;
+        if (!ctx.need_redraw && !plat_frame(ctx.plat)->ready) {
+            if (!plat_pump(ctx.plat, -1)) break;
             continue;
         }
         ctx.need_redraw = false;
+        if (ctx.resize_pending) {
+            plat_surface_resize(ctx.plat, ctx.width, ctx.height);
+            ctx.resize_pending = false;
+        }
 
         struct timespec ts_now;
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
@@ -1672,11 +1463,14 @@ int main(int argc, char **argv) {
             sprite_update(&g_sprites[i], mode, dt, t, scale, speed, ctx.width, ctx.height);
 
         bool menu_open = ringmenu_is_open(g_menu);
-        struct wl_region *region = wl_compositor_create_region(ctx.compositor);
+        int region_count = 0;
         if (menu_open) {
-            wl_region_add(region, 0, 0, ctx.width, ctx.height);
+            ctx.input_rects[region_count++] = (PlatRect){ 0, 0, ctx.width, ctx.height };
         } else if (g_ghost) {
-            wl_region_add(region, ctx.width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN, GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE);
+            ctx.input_rects[region_count++] = (PlatRect){
+                ctx.width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN, GHOST_ICON_MARGIN,
+                GHOST_ICON_SIZE, GHOST_ICON_SIZE
+            };
         } else {
             for (int i = 0; i < g_nsprites; i++) {
                 Sprite *s = &g_sprites[i];
@@ -1686,12 +1480,12 @@ int main(int argc, char **argv) {
                 float by = s->y + h * (4.f / 128.f);
                 float bw = w * (48.f / 72.f);
                 float bh = h * (60.f / 128.f);
-                wl_region_add(region, (int)floorf(bx), (int)floorf(by),
-                              (int)ceilf(bw), (int)ceilf(bh));
+                ctx.input_rects[region_count++] = (PlatRect){
+                    (int)floorf(bx), (int)floorf(by), (int)ceilf(bw), (int)ceilf(bh)
+                };
             }
         }
-        wl_surface_set_input_region(ctx.surface, region);
-        wl_region_destroy(region);
+        plat_input_region(ctx.plat, ctx.input_rects, region_count);
 
         if (menu_open || g_menu_was_open) g_full_damage = true;
         g_menu_was_open = menu_open;
@@ -1750,13 +1544,12 @@ int main(int argc, char **argv) {
 
         bool repaint_full = true;
         Rect repaint = {0, 0, 0, 0};
-        if (g_has_buffer_age && !frame_was_full_damage) {
-            EGLint age = 0;
-            if (eglQuerySurface(ctx.egl_display, ctx.egl_surface, EGL_BUFFER_AGE_EXT, &age) &&
-                age >= 1 && (int)age <= g_damage_hist_depth) {
+        int age = frame_was_full_damage ? 0 : plat_buffer_age(ctx.plat);
+        if (age >= 1) {
+            if (age <= g_damage_hist_depth) {
                 for (int d = 0; d < g_ncur_damage; d++)
                     rect_union(&repaint, &g_cur_damage[d]);
-                for (int k = 0; k < (int)age; k++)
+                for (int k = 0; k < age; k++)
                     for (int d = 0; d < g_damage_hist_n[k]; d++)
                         rect_union(&repaint, &g_damage_hist[k][d]);
                 if ((long long)repaint.w * repaint.h <=
@@ -1886,27 +1679,17 @@ int main(int argc, char **argv) {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
 
-        struct wl_callback *cb = wl_surface_frame(ctx.surface);
-        wl_callback_add_listener(cb, &frame_listener, &ctx);
-        if (g_swap_damage && !frame_was_full_damage) {
-            EGLint n = 0;
-            for (int d = 0; d < g_ncur_damage; d++) {
-                const Rect *r = &g_cur_damage[d];
-                g_damage_rects[n * 4 + 0] = r->x;
-                g_damage_rects[n * 4 + 1] = ctx.height - r->y - r->h; 
-                g_damage_rects[n * 4 + 2] = r->w;
-                g_damage_rects[n * 4 + 3] = r->h;
-                n++;
-            }
-            if (n == 0) {
-                g_damage_rects[0] = 0; g_damage_rects[1] = 0;
-                g_damage_rects[2] = 1; g_damage_rects[3] = 1;
-                n = 1;
-            }
-            g_swap_damage(ctx.egl_display, ctx.egl_surface, g_damage_rects, n);
+        plat_frame_request(ctx.plat);
+        if (plat_has_damage(ctx.plat) && !frame_was_full_damage) {
+            /* No damage at all still has to name something, or it means all. */
+            static const PlatRect one_pixel = { 0, 0, 1, 1 };
+            if (g_ncur_damage > 0)
+                plat_swap(ctx.plat, g_cur_damage, g_ncur_damage);
+            else
+                plat_swap(ctx.plat, &one_pixel, 1);
         } else {
             g_full_damage = false;
-            eglSwapBuffers(ctx.egl_display, ctx.egl_surface);
+            plat_swap(ctx.plat, NULL, 0);
         }
 
         if (g_damage_hist_depth < DAMAGE_HISTORY) g_damage_hist_depth++;
@@ -1925,35 +1708,14 @@ int main(int argc, char **argv) {
             g_damage_hist_n[0] = g_ncur_damage;
         }
 
-        wl_display_flush(ctx.display);
     }
 
     ringmenu_destroy(g_menu);
     free(g_menu_scratch);
-    if (ctx.cursor_surface) wl_surface_destroy(ctx.cursor_surface);
-    if (ctx.cursor_buffer) wl_buffer_destroy(ctx.cursor_buffer);
-    if (ctx.cursor_map) munmap(ctx.cursor_map, ctx.cursor_map_size);
-    if (ctx.hand_cursor_surface) wl_surface_destroy(ctx.hand_cursor_surface);
-    if (ctx.hand_cursor_buffer) wl_buffer_destroy(ctx.hand_cursor_buffer);
-    if (ctx.hand_cursor_map) munmap(ctx.hand_cursor_map, ctx.hand_cursor_map_size);
-    eglMakeCurrent(ctx.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    eglDestroySurface(ctx.egl_display, ctx.egl_surface);
-    wl_egl_window_destroy(ctx.egl_window);
-    eglDestroyContext(ctx.egl_display, ctx.egl_context);
-    eglTerminate(ctx.egl_display);
-    if (ctx.deco) {
-        zxdg_toplevel_decoration_v1_destroy(ctx.deco);
-    }
-    if (ctx.deco_mgr) {
-        zxdg_decoration_manager_v1_destroy(ctx.deco_mgr);
-    }
-    xdg_toplevel_destroy(ctx.toplevel);
-    xdg_surface_destroy(ctx.xdg_surface);
-    wl_surface_destroy(ctx.surface);
-    wl_display_roundtrip(ctx.display);
+    free(ctx.input_rects);
+    /* The window goes first, so the audio's fade plays out over the desktop. */
+    plat_close(ctx.plat);
 
-    audio_shutdown_graceful(); 
-
-    wl_display_disconnect(ctx.display);
+    audio_shutdown_graceful();
     return 0;
 }

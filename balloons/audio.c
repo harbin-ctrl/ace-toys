@@ -752,7 +752,7 @@ bool audio_init(void) {
     g_audio_stream = toy_audio_stream_start(&stream_config);
     if (!g_audio_stream) {
         fprintf(stderr,
-                "balloons: failed to start PipeWire audio; quitting\n");
+                "balloons: failed to start audio; quitting\n");
         audio_shutdown();
         return false;
     }

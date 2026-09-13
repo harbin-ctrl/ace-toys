@@ -10,14 +10,11 @@
 #include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <poll.h>
-#include <errno.h>
-#include <linux/memfd.h>
 #include <pthread.h>
 #include <stdint.h>
 
+#include "compat.h"
+#include "platform.h"
 #include "ringmenu.h"
 #include "toy_audio.h"
 #include "toy_audio_stream.h"
@@ -37,8 +34,7 @@ static inline uint32_t poingo_ticks_ms(void) {
 }
 
 static inline int poingo_cpu_count(void) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (int)n : 1;
+    return plat_cpu_count();
 }
 
 typedef struct { atomic_int value; } PoingoAtomic;
@@ -157,14 +153,7 @@ static uint8_t g_picker_color[3];
 static bool g_ring_right_release_pending = false;
 static bool g_ring_pointer_left_pending = false;
 
-#include <wayland-client.h>
-#include <wayland-egl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include <linux/input.h>
-#include <linux/input-event-codes.h>
-#include "xdg-shell-client-protocol.h"
 #include "ghost_icon.h"
 
 
@@ -870,7 +859,7 @@ static int generate_ball_frame_worker(void *userdata) {
         poingo_atomic_add(&ctx->completed, 1);
     }
 
-    free(ball_pixels);
+    poingo_aligned_free(ball_pixels);
     return 0;
 }
 
@@ -1107,7 +1096,7 @@ static bool init_audio(bool start_muted) {
     g_audio_stream = toy_audio_stream_start(&stream_config);
     if (unlikely(!g_audio_stream)) {
         fprintf(stderr,
-                "poingo: failed to start PipeWire audio; quitting\n");
+                "poingo: failed to start audio; quitting\n");
         shutdown_audio();
         return false;
     }
@@ -2059,33 +2048,12 @@ typedef struct {
     PoingoAtomic *unit_done;
 } RegenWorkerCtx;
 
-enum {
-    FREERANGE_GLOBAL_NONE = 0,
-};
-
 typedef struct {
-    struct wl_display *display;
-    struct wl_registry *registry;
-    struct wl_compositor *compositor;
-    struct wl_shm *shm;
-    struct wl_seat *seat;
-    struct wl_pointer *pointer;
-    struct wl_keyboard *keyboard;
-    struct wl_output *output;
-    struct xdg_wm_base *wm_base;
-    struct wl_surface *surface;
-    struct xdg_surface *xdg_surface;
-    struct xdg_toplevel *xdg_toplevel;
-    uint32_t compositor_name;
-    uint32_t shm_name;
-    uint32_t seat_name;
-    uint32_t output_name;
-    uint32_t wm_base_name;
+    Plat *plat;
+    /* Input region scratch, rebuilt every frame. */
+    PlatRect *input_rects;
+    int input_rect_cap;
 
-    EGLDisplay egl_display;
-    EGLContext egl_context;
-    EGLSurface egl_surface;
-    struct wl_egl_window *egl_window;
     GLuint gl_program;
     GLint gl_pos_loc;
     GLint gl_uv_loc;
@@ -2109,10 +2077,6 @@ typedef struct {
 
     int width;
     int height;
-    int pending_width;
-    int pending_height;
-    int refresh_mhz;
-    bool configured;
     bool resize_pending;
     bool running;
     bool ghost_mode;
@@ -2212,7 +2176,7 @@ static void freerange_color_regen_shutdown(FreedomState *st) {
         return;
     }
     freerange_regen_workers_shutdown(st);
-    free(st->color_regen_shadow_pixels);
+    poingo_aligned_free(st->color_regen_shadow_pixels);
     st->color_regen_shadow_pixels = NULL;
     st->color_regen_shadow_w = 0;
     st->color_regen_shadow_h = 0;
@@ -2283,7 +2247,7 @@ static int freerange_regen_worker(void *userdata) {
         poingo_atomic_set(&ctx->unit_done[seq], 1);
     }
 
-    free(ball_pixels);
+    poingo_aligned_free(ball_pixels);
     return 0;
 }
 
@@ -2624,10 +2588,8 @@ static void freerange_regen_upload_step(FreedomState *st, FreedomFrameSet *frame
 #define STREAK_SPAN 50.0f         /* how far round the ball the heels sit, degrees */
 
 static struct {
-    struct wl_surface *surface;
-    struct wl_buffer *buffers[CURSOR_BALL_FRAMES];
-    uint8_t *map;
-    size_t map_size;
+    Plat *plat;
+    uint32_t *pixels;   /* CURSOR_BALL_FRAMES squares, premultiplied ARGB */
     uint32_t *blade;   
     int current;
     bool ready;
@@ -2718,7 +2680,7 @@ static void blade_render(void) {
 }
 
 static void ball_cursor_render_frames(void) {
-    if (!g_ball_cursor.map) return;
+    if (!g_ball_cursor.pixels) return;
 
     const int size = CURSOR_BUF;
     const float radius = CURSOR_BALL_SIZE / 2.0f - 1.0f;
@@ -2736,8 +2698,7 @@ static void ball_cursor_render_frames(void) {
     light_x *= inv_len; light_y *= inv_len; light_z *= inv_len;
 
     for (int f = 0; f < CURSOR_BALL_FRAMES; f++) {
-        uint32_t *px = (uint32_t *)(g_ball_cursor.map +
-                                    (size_t)f * size * size * 4);
+        uint32_t *px = g_ball_cursor.pixels + (size_t)f * size * size;
         memcpy(px, g_ball_cursor.blade, (size_t)size * size * 4);
         float phase_norm = ((float)f / (float)CURSOR_BALL_FRAMES) *
                            angle_period / (2.0f * PI);
@@ -2801,38 +2762,11 @@ static bool ball_cursor_fail(void) {
     return false;
 }
 
-static bool ball_cursor_create(struct wl_shm *shm, struct wl_compositor *compositor) {
-    if (!shm || !compositor) return false;
-
-    int stride = CURSOR_BUF * 4;
-    size_t frame_bytes = (size_t)stride * CURSOR_BUF;
-    size_t total = frame_bytes * CURSOR_BALL_FRAMES;
-
-    int fd = memfd_create("poingo-cursor", MFD_CLOEXEC);
-    if (unlikely(fd < 0)) return false;
-    if (unlikely(ftruncate(fd, (off_t)total) < 0)) { close(fd); return false; }
-    void *data = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (unlikely(data == MAP_FAILED)) { close(fd); return false; }
-    g_ball_cursor.map = data;
-    g_ball_cursor.map_size = total;
-
-    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, (int32_t)total);
-    if (!pool) {
-        close(fd);
+static bool ball_cursor_create(Plat *plat) {
+    g_ball_cursor.pixels = malloc((size_t)CURSOR_BUF * CURSOR_BUF * 4 * CURSOR_BALL_FRAMES);
+    if (!g_ball_cursor.pixels) {
         return ball_cursor_fail();
     }
-    for (int f = 0; f < CURSOR_BALL_FRAMES; f++) {
-        g_ball_cursor.buffers[f] = wl_shm_pool_create_buffer(
-            pool, (int32_t)(f * frame_bytes),
-            CURSOR_BUF, CURSOR_BUF, stride, WL_SHM_FORMAT_ARGB8888);
-        if (!g_ball_cursor.buffers[f]) {
-            wl_shm_pool_destroy(pool);
-            close(fd);
-            return ball_cursor_fail();
-        }
-    }
-    wl_shm_pool_destroy(pool);
-    close(fd);
 
     g_ball_cursor.blade = malloc((size_t)CURSOR_BUF * CURSOR_BUF * 4);
     if (!g_ball_cursor.blade) {
@@ -2843,22 +2777,14 @@ static bool ball_cursor_create(struct wl_shm *shm, struct wl_compositor *composi
     compute_axis_vectors();
     ball_cursor_render_frames();
 
-    g_ball_cursor.surface = wl_compositor_create_surface(compositor);
-    if (!g_ball_cursor.surface) {
+    if (plat_cursor_create(plat, g_ball_cursor.pixels, CURSOR_BUF,
+                           CURSOR_BALL_FRAMES, CURSOR_TIP, CURSOR_TIP) < 0) {
         return ball_cursor_fail();
     }
-    wl_surface_attach(g_ball_cursor.surface, g_ball_cursor.buffers[0], 0, 0);
-    wl_surface_damage(g_ball_cursor.surface, 0, 0, CURSOR_BUF, CURSOR_BUF);
-    wl_surface_commit(g_ball_cursor.surface);
+    g_ball_cursor.plat = plat;
     g_ball_cursor.current = 0;
     g_ball_cursor.ready = true;
     return true;
-}
-
-static void ball_cursor_set(struct wl_pointer *pointer, uint32_t serial) {
-    if (!g_ball_cursor.ready) return;
-    wl_pointer_set_cursor(pointer, serial, g_ball_cursor.surface,
-                          CURSOR_TIP, CURSOR_TIP);
 }
 
 static void ball_cursor_animate(int phase_i, int frame_count) {
@@ -2868,18 +2794,12 @@ static void ball_cursor_animate(int phase_i, int frame_count) {
     if (f < 0) f += CURSOR_BALL_FRAMES;
     if (f == g_ball_cursor.current) return;
     g_ball_cursor.current = f;
-    wl_surface_attach(g_ball_cursor.surface, g_ball_cursor.buffers[f], 0, 0);
-    wl_surface_damage(g_ball_cursor.surface, 0, 0, CURSOR_BUF, CURSOR_BUF);
-    wl_surface_commit(g_ball_cursor.surface);
+    plat_cursor_frame(g_ball_cursor.plat, f);
 }
 
+/* The platform's copy of the frames goes with plat_close(). */
 static void ball_cursor_destroy(void) {
-    for (int f = 0; f < CURSOR_BALL_FRAMES; f++) {
-        if (g_ball_cursor.buffers[f]) wl_buffer_destroy(g_ball_cursor.buffers[f]);
-        g_ball_cursor.buffers[f] = NULL;
-    }
-    if (g_ball_cursor.surface) wl_surface_destroy(g_ball_cursor.surface);
-    if (g_ball_cursor.map) munmap(g_ball_cursor.map, g_ball_cursor.map_size);
+    free(g_ball_cursor.pixels);
     free(g_ball_cursor.blade);
     memset(&g_ball_cursor, 0, sizeof(g_ball_cursor));
 }
@@ -3194,7 +3114,7 @@ static void step_balls(FreedomState *st, double sim_delta, BallSound sound) {
 }
 
 static float random_unit(void) {
-    return (float)random() / (float)RAND_MAX;
+    return (float)random() / (float)POINGO_RANDOM_MAX;
 }
 
 static void random_ball_palette(PoingoBall *ball) {
@@ -3919,54 +3839,26 @@ static void freerange_gl_draw_hud(FreedomState *st) {
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-/* Returns false once the connection is gone, so the caller can wind down
-   instead of spinning on a dead socket. */
-static bool freerange_pump_events(struct wl_display *display, int timeout_ms) {
-    if (!display) {
-        return false;
-    }
-
-    while (wl_display_prepare_read(display) != 0) {
-        if (wl_display_dispatch_pending(display) < 0) {
-            return false;
+/* Appends a rectangle to the input region scratch, growing it on demand. A
+   failed grow drops the rectangle: a ball is briefly harder to catch, and the
+   next frame tries again. Returns the new count. */
+static int input_rect_add(FreedomState *st, int count, int x, int y, int w, int h) {
+    if (count >= st->input_rect_cap) {
+        int cap = st->input_rect_cap > 0 ? st->input_rect_cap * 2 : 256;
+        PlatRect *grown = realloc(st->input_rects, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return count;
         }
+        st->input_rects = grown;
+        st->input_rect_cap = cap;
     }
-
-    /* The moving input region alone is many wl_region_add requests per frame,
-       so the outgoing buffer really can fill. EAGAIN means "not all of it
-       went"; waiting only for POLLIN there would sit on an unsent batch until
-       the timeout. Wait for writability too and let the next flush finish. */
-    short events = POLLIN;
-    if (wl_display_flush(display) < 0) {
-        if (errno != EAGAIN) {
-            wl_display_cancel_read(display);
-            return false;
-        }
-        events |= POLLOUT;
-    }
-
-    struct pollfd pfd = {
-        .fd = wl_display_get_fd(display),
-        .events = events,
-        .revents = 0
-    };
-
-    int poll_result = poll(&pfd, 1, timeout_ms);
-    if (poll_result < 0 && errno != EINTR) {
-        wl_display_cancel_read(display);
-        return false;
-    }
-    if (poll_result <= 0 || !(pfd.revents & POLLIN)) {
-        wl_display_cancel_read(display);
-    } else if (wl_display_read_events(display) < 0) {
-        return false;
-    }
-
-    return wl_display_dispatch_pending(display) >= 0;
+    st->input_rects[count] = (PlatRect){ x, y, w, h };
+    return count + 1;
 }
 
-static void add_ball_region(struct wl_region *region, const PoingoBall *ball,
-                            int width, int height) {
+static int add_ball_region(FreedomState *st, int count, const PoingoBall *ball) {
+    int width = st->width;
+    int height = st->height;
     float center_x = ball->x + ball->diameter * 0.5f;
     float center_y = ball->y * (float)height + ball->diameter * 0.5f;
     float radius = ball->diameter * 0.5f;
@@ -3993,36 +3885,31 @@ static void add_ball_region(struct wl_region *region, const PoingoBall *ball,
             region_width = width - x;
         }
         if (region_width > 0) {
-            wl_region_add(region, x, y, region_width, row_step);
+            count = input_rect_add(st, count, x, y, region_width, row_step);
         }
     }
+    return count;
 }
 
 static void freerange_update_input_region(FreedomState *st) {
-    if (!st || !st->compositor || !st->surface ||
-        st->width <= 0 || st->height <= 0) {
+    if (!st || !st->plat || st->width <= 0 || st->height <= 0) {
         return;
     }
 
-    struct wl_region *region = wl_compositor_create_region(st->compositor);
-    if (!region) {
-        return;
-    }
-
+    int count = 0;
     if (g_menu && ringmenu_is_open(g_menu)) {
-        wl_region_add(region, 0, 0, st->width, st->height);
+        count = input_rect_add(st, count, 0, 0, st->width, st->height);
     } else if (st->ghost_mode) {
-        wl_region_add(region,
-                      st->width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN,
-                      GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE);
+        count = input_rect_add(st, count,
+                               st->width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN,
+                               GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE);
     } else {
         for (int i = 0; i < st->ball_count; i++) {
-            add_ball_region(region, &st->balls[i], st->width, st->height);
+            count = add_ball_region(st, count, &st->balls[i]);
         }
     }
 
-    wl_surface_set_input_region(st->surface, region);
-    wl_region_destroy(region);
+    plat_input_region(st->plat, st->input_rects, count);
 }
 
 typedef struct {
@@ -4095,7 +3982,7 @@ static bool freerange_generate_frames(FreedomFrameSet *out_frames, int frame_cou
     uint8_t *frame_buffer = NULL;
     if (posix_memalign((void**)&frame_buffer, 32, total_frame_bytes) != 0) {
         fprintf(stderr, "Failed to allocate frame pixel buffer\n");
-        free(shadow_pixels);
+        poingo_aligned_free(shadow_pixels);
         return false;
     }
 
@@ -4131,8 +4018,8 @@ static bool freerange_generate_frames(FreedomFrameSet *out_frames, int frame_cou
     pthread_t **threads = calloc((size_t)thread_count, sizeof(pthread_t *));
     if (!threads) {
         fprintf(stderr, "Failed to allocate frame threads\n");
-        free(frame_buffer);
-        free(shadow_pixels);
+        poingo_aligned_free(frame_buffer);
+        poingo_aligned_free(shadow_pixels);
         return false;
     }
 
@@ -4155,11 +4042,11 @@ static bool freerange_generate_frames(FreedomFrameSet *out_frames, int frame_cou
                   poingo_atomic_get(&job_ctx.completed) != frame_count;
 
     free(threads);
-    free(shadow_pixels);
+    poingo_aligned_free(shadow_pixels);
 
     if (failed) {
         fprintf(stderr, "Ball frame generation failed\n");
-        free(frame_buffer);
+        poingo_aligned_free(frame_buffer);
         return false;
     }
 
@@ -4203,7 +4090,7 @@ static void freerange_destroy_frames(FreedomFrameSet *frames) {
     if (!frames) {
         return;
     }
-    free(frames->frames);
+    poingo_aligned_free(frames->frames);
     frames->frames = NULL;
     frames->frame_size = 0;
     frames->frame_count = 0;
@@ -4242,8 +4129,8 @@ static bool make_basis_frames(FreedomFrameSet *out_frames, int frame_count,
     if (ok) {
         size_t total_size = modes[0].frame_size * (size_t)frame_count *
                             BALL_MODE_COUNT;
-        uint8_t *combined = malloc(total_size);
-        if (!combined) {
+        uint8_t *combined = NULL;
+        if (posix_memalign((void **)&combined, 32, total_size) != 0) {
             ok = false;
         } else {
             for (int mode = 0; mode < BALL_MODE_COUNT; mode++) {
@@ -4271,31 +4158,17 @@ static bool make_basis_frames(FreedomFrameSet *out_frames, int frame_count,
     return ok;
 }
 
-static void freerange_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
-    (void)data;
-    xdg_wm_base_pong(wm_base, serial);
-}
-
-static const struct xdg_wm_base_listener freerange_wm_base_listener = {
-    .ping = freerange_wm_base_ping,
-};
-
-static void freerange_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
-                                       int32_t width, int32_t height, struct wl_array *states) {
-    (void)toplevel;
-    (void)states;
+static void freerange_resize(void *data, int width, int height) {
     FreedomState *st = data;
-    if (!st) {
+    if (!st || width <= 0 || height <= 0) {
         return;
     }
-    if (width > 0 && height > 0) {
-        st->pending_width = width;
-        st->pending_height = height;
-    }
+    st->width = width;
+    st->height = height;
+    st->resize_pending = true;
 }
 
-static void freerange_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
-    (void)toplevel;
+static void freerange_close(void *data) {
     FreedomState *st = data;
     if (st) {
         /* Treat compositor/taskbar close exactly like the in-app QUIT action. */
@@ -4303,100 +4176,17 @@ static void freerange_toplevel_close(void *data, struct xdg_toplevel *toplevel) 
     }
 }
 
-static const struct xdg_toplevel_listener freerange_toplevel_listener = {
-    .configure = freerange_toplevel_configure,
-    .close = freerange_toplevel_close,
-};
-
-static void freerange_xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
+static void freerange_pointer_enter(void *data, int x, int y) {
     FreedomState *st = data;
     if (!st) {
         return;
     }
-    xdg_surface_ack_configure(surface, serial);
-    st->configured = true;
-    if (st->pending_width > 0 && st->pending_height > 0) {
-        st->width = st->pending_width;
-        st->height = st->pending_height;
-        st->pending_width = 0;
-        st->pending_height = 0;
-        st->resize_pending = true;
-    }
+    st->pointer_x = x;
+    st->pointer_y = y;
 }
 
-static const struct xdg_surface_listener freerange_xdg_surface_listener = {
-    .configure = freerange_xdg_surface_configure,
-};
-
-static void freerange_output_mode(void *data, struct wl_output *output,
-                                uint32_t flags, int width, int height, int refresh) {
-    (void)output;
-    FreedomState *st = data;
-    if (!st) {
-        return;
-    }
-    if (flags & WL_OUTPUT_MODE_CURRENT) {
-        st->width = width;
-        st->height = height;
-        st->refresh_mhz = refresh;
-    }
-}
-
-static void freerange_output_geometry(void *data, struct wl_output *output,
-                                    int32_t x, int32_t y,
-                                    int32_t phys_width, int32_t phys_height,
-                                    int32_t subpixel,
-                                    const char *make, const char *model,
-                                    int32_t transform) {
+static void freerange_pointer_leave(void *data) {
     (void)data;
-    (void)output;
-    (void)x;
-    (void)y;
-    (void)phys_width;
-    (void)phys_height;
-    (void)subpixel;
-    (void)make;
-    (void)model;
-    (void)transform;
-}
-
-static void freerange_output_done(void *data, struct wl_output *output) {
-    (void)data;
-    (void)output;
-}
-
-static void freerange_output_scale(void *data, struct wl_output *output, int32_t factor) {
-    (void)data;
-    (void)output;
-    (void)factor;
-}
-
-static const struct wl_output_listener freerange_output_listener = {
-    .geometry = freerange_output_geometry,
-    .mode = freerange_output_mode,
-    .done = freerange_output_done,
-    .scale = freerange_output_scale,
-};
-
-static void freerange_pointer_enter(void *data, struct wl_pointer *pointer,
-                                  uint32_t serial, struct wl_surface *surface,
-                                  wl_fixed_t surface_x, wl_fixed_t surface_y) {
-    (void)surface;
-    FreedomState *st = data;
-    if (!st) {
-        return;
-    }
-    st->pointer_x = wl_fixed_to_int(surface_x);
-    st->pointer_y = wl_fixed_to_int(surface_y);
-    ball_cursor_set(pointer, serial);
-}
-
-static void freerange_pointer_leave(void *data, struct wl_pointer *pointer,
-                                  uint32_t serial, struct wl_surface *surface) {
-    (void)data;
-    (void)pointer;
-    (void)serial;
-    (void)surface;
 
     if (!g_menu || !ringmenu_is_open(g_menu)) {
         return;
@@ -4429,16 +4219,11 @@ static void freerange_pointer_leave(void *data, struct wl_pointer *pointer,
     }
 }
 
-static void freerange_pointer_motion(void *data, struct wl_pointer *pointer,
-                                   uint32_t time, wl_fixed_t surface_x, wl_fixed_t surface_y) {
-    (void)pointer;
-    (void)time;
+static void freerange_pointer_motion(void *data, int x, int y) {
     FreedomState *st = data;
     if (!st) {
         return;
     }
-    int x = wl_fixed_to_int(surface_x);
-    int y = wl_fixed_to_int(surface_y);
     st->pointer_x = x;
     st->pointer_y = y;
 
@@ -4745,12 +4530,7 @@ static void freerange_resolve_pending_ring_release(void) {
     freerange_ring_menu_button(st, RINGMENU_BTN_RIGHT, false);
 }
 
-static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
-                                   uint32_t serial, uint32_t time, uint32_t button,
-                                   uint32_t state) {
-    (void)pointer;
-    (void)serial;
-    (void)time;
+static void freerange_pointer_button(void *data, PlatButton button, PlatPress press) {
     FreedomState *st = data;
     if (!st) {
         return;
@@ -4759,17 +4539,17 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
         /* The grab and the menu are separate states that happen to share the
            pointer, so an open menu must not swallow the end of a grab: the
            release still drops the ball, then goes on to the menu as usual. */
-        if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        if (button == PLAT_BTN_LEFT && press == PLAT_RELEASED) {
             freerange_release_grab(st);
         }
 
         int rbtn = -1;
-        if (button == BTN_LEFT) rbtn = RINGMENU_BTN_LEFT;
-        else if (button == BTN_RIGHT) rbtn = RINGMENU_BTN_RIGHT;
-        else if (button == BTN_MIDDLE) rbtn = RINGMENU_BTN_MIDDLE;
+        if (button == PLAT_BTN_LEFT) rbtn = RINGMENU_BTN_LEFT;
+        else if (button == PLAT_BTN_RIGHT) rbtn = RINGMENU_BTN_RIGHT;
+        else if (button == PLAT_BTN_MIDDLE) rbtn = RINGMENU_BTN_MIDDLE;
 
         if (rbtn >= 0) {
-            bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+            bool pressed = (press == PLAT_PRESSED);
 
             /*
              * Only a right release is ever at risk of being labwc's
@@ -4790,7 +4570,7 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
         return;
     }
 
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_RIGHT) {
+    if (press == PLAT_PRESSED && button == PLAT_BTN_RIGHT) {
         int target = ball_at(st, st->pointer_x, st->pointer_y);
         if (g_menu && target >= 0) {
             st->menu_ball = target;
@@ -4812,22 +4592,22 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
     }
 
     if (st->ghost_mode) {
-        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (press == PLAT_PRESSED) {
             st->ghost_mode = false;
             g_ghost_mute = false;
         }
         return;
     }
 
-    if (button == BTN_MIDDLE) {
+    if (button == PLAT_BTN_MIDDLE) {
         return;
     }
 
-    if (button != BTN_LEFT) {
+    if (button != PLAT_BTN_LEFT) {
         return;
     }
 
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (press == PLAT_PRESSED) {
         st->pointer_down = true;
 
         int target = ball_at(st, st->pointer_x, st->pointer_y);
@@ -4848,7 +4628,7 @@ static void freerange_pointer_button(void *data, struct wl_pointer *pointer,
             st->slingshot_pull_x = 0.0f;
             st->slingshot_pull_y = 0.0f;
         }
-    } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+    } else if (press == PLAT_RELEASED) {
         freerange_release_grab(st);
     }
 }
@@ -4890,51 +4670,16 @@ static void freerange_adjust_ball_scale(FreedomState *st, int direction) {
     }
 }
 
-static void freerange_pointer_axis(void *data, struct wl_pointer *pointer,
-                                 uint32_t time, uint32_t axis, wl_fixed_t value) {
-    (void)pointer;
-    (void)time;
+static void freerange_pointer_scroll(void *data, double delta) {
     FreedomState *st = data;
     if (!st || st->grabbed_ball < 0 || st->grabbed_ball >= st->ball_count) {
         return;
     }
-    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        return;
-    }
-    double delta = wl_fixed_to_double(value);
     if (delta == 0.0) {
         return;
     }
     freerange_adjust_ball_scale(st, delta < 0.0 ? 1 : -1);
 	}
-
-static const struct wl_pointer_listener freerange_pointer_listener = {
-    .enter = freerange_pointer_enter,
-    .leave = freerange_pointer_leave,
-    .motion = freerange_pointer_motion,
-    .button = freerange_pointer_button,
-    .axis = freerange_pointer_axis,
-};
-
-static void freerange_keyboard_keymap(void *data, struct wl_keyboard *keyboard,
-                                    uint32_t format, int fd, uint32_t size) {
-    (void)data;
-    (void)keyboard;
-    (void)format;
-    (void)size;
-    if (fd >= 0) {
-        close(fd);
-    }
-}
-
-static void freerange_keyboard_enter(void *data, struct wl_keyboard *keyboard,
-                                   uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
-    (void)data;
-    (void)keyboard;
-    (void)serial;
-    (void)surface;
-    (void)keys;
-}
 
 /* Key repeat runs off these flags and only a RELEASED event clears them, but
    a key held as focus leaves never sends one -- it would repeat forever. */
@@ -4948,109 +4693,71 @@ static void freerange_clear_held_keys(FreedomState *st) {
     st->key_speed_down_pressed = false;
 }
 
-static void freerange_keyboard_leave(void *data, struct wl_keyboard *keyboard,
-                                   uint32_t serial, struct wl_surface *surface) {
-    (void)keyboard;
-    (void)serial;
-    (void)surface;
+static void freerange_keyboard_leave(void *data) {
     freerange_clear_held_keys(data);
 }
 
-static void freerange_keyboard_key(void *data, struct wl_keyboard *keyboard,
-                                 uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
-    (void)data;
-    (void)keyboard;
-    (void)serial;
-    (void)time;
+static void freerange_keyboard_key(void *data, PlatKey key, PlatPress press) {
     FreedomState *st = data;
     if (!st) {
         return;
     }
-    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        if (key == KEY_Q) {
+    if (press == PLAT_PRESSED) {
+        if (key == PLAT_KEY_Q) {
             freerange_request_graceful_shutdown(st);
-        } else if (key == KEY_ESC) {
+        } else if (key == PLAT_KEY_ESC) {
             freerange_request_graceful_shutdown(st);
-        } else if (key == KEY_M) {
+        } else if (key == PLAT_KEY_M) {
             toggle_master_mute();
-        } else if (key == KEY_A) {
+        } else if (key == PLAT_KEY_A) {
             int target = st->grabbed_ball >= 0
                              ? st->grabbed_ball
                              : ball_at(st, st->pointer_x, st->pointer_y);
             if (target >= 0) {
                 set_ball_mode(&st->balls[target], BALL_MODE_NOSTALGIA);
             }
-        } else if (key == KEY_P) {
+        } else if (key == PLAT_KEY_P) {
             int target = st->grabbed_ball >= 0
                              ? st->grabbed_ball
                              : ball_at(st, st->pointer_x, st->pointer_y);
             if (target >= 0) {
                 set_ball_mode(&st->balls[target], BALL_MODE_POINGO);
             }
-        } else if (key == KEY_C) {
+        } else if (key == PLAT_KEY_C) {
             int target = st->grabbed_ball >= 0
                              ? st->grabbed_ball
                              : ball_at(st, st->pointer_x, st->pointer_y);
             if (target >= 0) {
                 random_ball_palette(&st->balls[target]);
             }
-        } else if (key == KEY_SPACE) {
+        } else if (key == PLAT_KEY_SPACE) {
             st->ghost_mode = !st->ghost_mode;
             g_ghost_mute = st->ghost_mode;
-        } else if (key == KEY_LEFTBRACE) {
+        } else if (key == PLAT_KEY_LEFTBRACE) {
             freerange_adjust_ball_scale(st, -1);
-        } else if (key == KEY_RIGHTBRACE) {
+        } else if (key == PLAT_KEY_RIGHTBRACE) {
             freerange_adjust_ball_scale(st, 1);
-        } else if (key == KEY_UP) {
+        } else if (key == PLAT_KEY_UP) {
             st->key_vol_up_pressed = true;
-        } else if (key == KEY_DOWN) {
+        } else if (key == PLAT_KEY_DOWN) {
             st->key_vol_down_pressed = true;
-        } else if (key == KEY_RIGHT) {
+        } else if (key == PLAT_KEY_RIGHT) {
             st->key_speed_up_pressed = true;
-        } else if (key == KEY_LEFT) {
+        } else if (key == PLAT_KEY_LEFT) {
             st->key_speed_down_pressed = true;
         }
-    } else if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
-        if (key == KEY_UP) {
+    } else if (press == PLAT_RELEASED) {
+        if (key == PLAT_KEY_UP) {
             st->key_vol_up_pressed = false;
-        } else if (key == KEY_DOWN) {
+        } else if (key == PLAT_KEY_DOWN) {
             st->key_vol_down_pressed = false;
-        } else if (key == KEY_RIGHT) {
+        } else if (key == PLAT_KEY_RIGHT) {
             st->key_speed_up_pressed = false;
-        } else if (key == KEY_LEFT) {
+        } else if (key == PLAT_KEY_LEFT) {
             st->key_speed_down_pressed = false;
         }
     }
 }
-
-static void freerange_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
-                                       uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
-                                       uint32_t mods_locked, uint32_t group) {
-    (void)data;
-    (void)keyboard;
-    (void)serial;
-    (void)mods_depressed;
-    (void)mods_latched;
-    (void)mods_locked;
-    (void)group;
-}
-
-static void freerange_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
-                                         int32_t rate, int32_t delay) {
-    (void)data;
-    (void)keyboard;
-    (void)rate;
-    (void)delay;
-}
-
-static const struct wl_keyboard_listener freerange_keyboard_listener = {
-    .keymap = freerange_keyboard_keymap,
-    .enter = freerange_keyboard_enter,
-    .leave = freerange_keyboard_leave,
-    .key = freerange_keyboard_key,
-    .modifiers = freerange_keyboard_modifiers,
-    .repeat_info = freerange_keyboard_repeat_info,
-};
 
 /* A removed pointer cannot send the release that ends its grab. */
 static void freerange_clear_pointer(FreedomState *st) {
@@ -5064,161 +4771,9 @@ static void freerange_clear_pointer(FreedomState *st) {
     st->slingshot_pull_y = 0.0f;
 }
 
-static void freerange_seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) {
-    FreedomState *st = data;
-    if (!st) {
-        return;
-    }
-    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !st->pointer) {
-        st->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(st->pointer, &freerange_pointer_listener, st);
-    }
-    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !st->keyboard) {
-        st->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(st->keyboard, &freerange_keyboard_listener, st);
-    }
-    if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD)) {
-        if (st->keyboard) {
-            wl_keyboard_destroy(st->keyboard);
-            st->keyboard = NULL;
-        }
-        /* The keys held when it vanished will never see a release. */
-        freerange_clear_held_keys(st);
-    }
-    /* The protocol asks clients to release the object whose capability has
-       gone, the pointer included. */
-    if (!(capabilities & WL_SEAT_CAPABILITY_POINTER)) {
-        if (st->pointer) {
-            wl_pointer_destroy(st->pointer);
-            st->pointer = NULL;
-        }
-        freerange_clear_pointer(st);
-    }
+static void freerange_pointer_lost(void *data) {
+    freerange_clear_pointer(data);
 }
-
-static void freerange_seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data;
-    (void)seat;
-    (void)name;
-}
-
-static const struct wl_seat_listener freerange_seat_listener = {
-    .capabilities = freerange_seat_capabilities,
-    .name = freerange_seat_name,
-};
-
-static void freerange_registry_global(void *data, struct wl_registry *registry,
-                                    uint32_t name, const char *interface, uint32_t version) {
-    FreedomState *st = data;
-    if (!st) {
-        return;
-    }
-
-    /* version is the highest the compositor supports, not the one to use.
-       Asking for more than it offers is a protocol error, and the client is
-       killed for it. */
-    #define BIND_VERSION(wanted) ((version) < (wanted) ? (version) : (uint32_t)(wanted))
-
-    if (strcmp(interface, wl_compositor_interface.name) == 0 && !st->compositor) {
-        st->compositor = wl_registry_bind(registry, name, &wl_compositor_interface,
-                                          BIND_VERSION(4));
-        if (st->compositor) {
-            st->compositor_name = name;
-        }
-    } else if (strcmp(interface, wl_shm_interface.name) == 0 && !st->shm) {
-        st->shm = wl_registry_bind(registry, name, &wl_shm_interface, BIND_VERSION(1));
-        if (st->shm) {
-            st->shm_name = name;
-        }
-    } else if (strcmp(interface, wl_seat_interface.name) == 0 && !st->seat) {
-        /* One seat owns the single pointer/keyboard state. */
-        st->seat = wl_registry_bind(registry, name, &wl_seat_interface, BIND_VERSION(1));
-        if (st->seat) {
-            st->seat_name = name;
-            wl_seat_add_listener(st->seat, &freerange_seat_listener, st);
-        }
-    } else if (strcmp(interface, wl_output_interface.name) == 0 && !st->output) {
-        /* Only the first. Poingo tracks a single output, and letting each new
-           one overwrite it leaked the previous proxy and made the mode report
-           that won -- and so target_fps -- depend on advertisement order on a
-           mixed-refresh desktop. */
-        st->output = wl_registry_bind(registry, name, &wl_output_interface,
-                                      BIND_VERSION(2));
-        if (st->output) {
-            st->output_name = name;
-            wl_output_add_listener(st->output, &freerange_output_listener, st);
-        }
-    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0 && !st->wm_base) {
-        st->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface,
-                                       BIND_VERSION(1));
-        if (st->wm_base) {
-            st->wm_base_name = name;
-            xdg_wm_base_add_listener(st->wm_base, &freerange_wm_base_listener, st);
-        }
-    }
-
-    #undef BIND_VERSION
-}
-
-static void freerange_registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)registry;
-    FreedomState *st = data;
-    if (!st) {
-        return;
-    }
-
-    if (name == st->seat_name) {
-        if (st->pointer) {
-            wl_pointer_destroy(st->pointer);
-            st->pointer = NULL;
-        }
-        if (st->keyboard) {
-            wl_keyboard_destroy(st->keyboard);
-            st->keyboard = NULL;
-        }
-        if (st->seat) {
-            wl_seat_destroy(st->seat);
-            st->seat = NULL;
-        }
-        st->seat_name = FREERANGE_GLOBAL_NONE;
-        freerange_clear_held_keys(st);
-        freerange_clear_pointer(st);
-        return;
-    }
-    if (name == st->output_name) {
-        if (st->output) {
-            wl_output_destroy(st->output);
-            st->output = NULL;
-        }
-        st->output_name = FREERANGE_GLOBAL_NONE;
-        st->refresh_mhz = 0;
-        return;
-    }
-    if (name == st->shm_name) {
-        if (st->shm) {
-            wl_shm_destroy(st->shm);
-            st->shm = NULL;
-        }
-        st->shm_name = FREERANGE_GLOBAL_NONE;
-        return;
-    }
-    if (name == st->compositor_name) {
-        /* Its surfaces must die before the proxy. */
-        st->compositor_name = FREERANGE_GLOBAL_NONE;
-        st->running = false;
-        return;
-    }
-    if (name == st->wm_base_name) {
-        /* Destroying this with xdg_surfaces alive is a protocol error. */
-        st->wm_base_name = FREERANGE_GLOBAL_NONE;
-        st->running = false;
-    }
-}
-
-static const struct wl_registry_listener freerange_registry_listener = {
-    .global = freerange_registry_global,
-    .global_remove = freerange_registry_global_remove,
-};
 
 static void freerange_signal_handler(int signum) {
     (void)signum;
@@ -5226,62 +4781,6 @@ static void freerange_signal_handler(int signum) {
      * ball fades out and the audio rides down with it. A second one means
      * whoever sent the first has run out of patience: drop the fade and go. */
     g_freerange_quit_requested = g_freerange_quit_requested ? 2 : 1;
-}
-typedef struct {
-    bool     ready;
-    uint32_t compositor_ms;   
-    uint64_t delivery_ns;     
-    struct wl_callback *callback;
-} FrameCbData;
-
-static void wayland_frame_done(void *data, struct wl_callback *callback, uint32_t time) {
-    struct timespec _ts;
-    clock_gettime(CLOCK_MONOTONIC, &_ts);
-    FrameCbData *fcb = (FrameCbData *)data;
-    if (fcb->callback == callback) {
-        fcb->callback = NULL;
-    }
-    fcb->delivery_ns  = (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
-    fcb->ready        = true;
-    fcb->compositor_ms = time;
-    wl_callback_destroy(callback);
-}
-
-static const struct wl_callback_listener wayland_frame_listener = {
-    .done = wayland_frame_done
-};
-
-/* Hidden surfaces may withhold a callback indefinitely. */
-static bool wayland_frame_can_request(const FrameCbData *fcb) {
-    return fcb && !fcb->callback;
-}
-
-static bool wayland_frame_request(struct wl_surface *surface, FrameCbData *fcb) {
-    if (!surface || !wayland_frame_can_request(fcb)) {
-        return false;
-    }
-
-    struct wl_callback *callback = wl_surface_frame(surface);
-    if (!callback) {
-        return false;
-    }
-    if (wl_callback_add_listener(callback, &wayland_frame_listener, fcb) < 0) {
-        wl_callback_destroy(callback);
-        return false;
-    }
-
-    fcb->callback = callback;
-    fcb->ready = false;
-    return true;
-}
-
-static void wayland_frame_cancel(FrameCbData *fcb) {
-    if (!fcb || !fcb->callback) {
-        return;
-    }
-
-    wl_callback_destroy(fcb->callback);
-    fcb->callback = NULL;
 }
 
 
@@ -5347,59 +4846,40 @@ static void poingo_menu_destroy(void) {
     g_ring_deferred_st = NULL;
 }
 
-/* Destroy bound globals before disconnecting their display. */
-static void freerange_globals_destroy(FreedomState *st) {
-    if (!st) {
-        return;
-    }
+static const PlatHandlers freerange_handlers = {
+    .pointer_enter = freerange_pointer_enter,
+    .pointer_leave = freerange_pointer_leave,
+    .pointer_motion = freerange_pointer_motion,
+    .pointer_button = freerange_pointer_button,
+    .pointer_scroll = freerange_pointer_scroll,
+    .pointer_lost = freerange_pointer_lost,
+    .key = freerange_keyboard_key,
+    .keyboard_lost = freerange_keyboard_leave,
+    .resize = freerange_resize,
+    .close = freerange_close,
+};
 
-    if (st->pointer) {
-        wl_pointer_destroy(st->pointer);
-        st->pointer = NULL;
-    }
-    if (st->keyboard) {
-        wl_keyboard_destroy(st->keyboard);
-        st->keyboard = NULL;
-    }
-    if (st->seat) {
-        wl_seat_destroy(st->seat);
-        st->seat = NULL;
-    }
-    if (st->output) {
-        wl_output_destroy(st->output);
-        st->output = NULL;
-    }
-    if (st->wm_base) {
-        xdg_wm_base_destroy(st->wm_base);
-        st->wm_base = NULL;
-    }
-    if (st->shm) {
-        wl_shm_destroy(st->shm);
-        st->shm = NULL;
-    }
-    if (st->compositor) {
-        wl_compositor_destroy(st->compositor);
-        st->compositor = NULL;
-    }
-    if (st->registry) {
-        wl_registry_destroy(st->registry);
-        st->registry = NULL;
-    }
-    if (st->display) {
-        wl_display_disconnect(st->display);
-        st->display = NULL;
-    }
+/* The one exit path, for a startup failure at any step and for a normal
+   quit alike. GL objects go while their context still exists; the workers
+   are joined before the frames they write are freed. */
+static void freerange_teardown(FreedomState *st, FreedomFrameSet *frames) {
+    poingo_menu_destroy();
+    freerange_gl_shutdown(st);
+    ball_cursor_destroy();
+    plat_close(st->plat);
+    st->plat = NULL;
 
-    st->compositor_name = FREERANGE_GLOBAL_NONE;
-    st->shm_name = FREERANGE_GLOBAL_NONE;
-    st->seat_name = FREERANGE_GLOBAL_NONE;
-    st->output_name = FREERANGE_GLOBAL_NONE;
-    st->wm_base_name = FREERANGE_GLOBAL_NONE;
-    freerange_clear_held_keys(st);
-    freerange_clear_pointer(st);
+    freerange_color_regen_shutdown(st);
+    freerange_destroy_frames(frames);
+    shutdown_audio();
+    free(st->regen_unit_done_storage);
+    free(st->regen_order_storage);
+    free(st->regen_thread_storage);
+    free(st->input_rects);
+    release_sphere_pixel_cache();
 }
 
-static int run_freerange_wayland(bool start_muted) {
+static int run_freerange(bool start_muted) {
     FreedomState st = {0};
     st.running = true;
     st.make_noise = true;
@@ -5422,74 +4902,27 @@ static int run_freerange_wayland(bool start_muted) {
         seeded = true;
     }
 
-    st.display = wl_display_connect(NULL);
-    if (!st.display) {
-        fprintf(stderr, "Failed to connect to Wayland display\n");
+    PlatConfig plat_config = {
+        .title = "Poingo",
+        .app_id = "poingo",
+        .log = g_debug_mode ? PLAT_LOG_DEBUG : PLAT_LOG_QUIET,
+    };
+    FreedomFrameSet frames = {0};
+    st.plat = plat_open(&plat_config, &freerange_handlers, &st);
+    if (!st.plat) {
         return 1;
     }
 
-    st.registry = wl_display_get_registry(st.display);
-    if (!st.registry) {
-        fprintf(stderr, "Failed to get Wayland registry\n");
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
-    wl_registry_add_listener(st.registry, &freerange_registry_listener, &st);
-    wl_display_roundtrip(st.display);
-    if (st.output) {
-        wl_display_roundtrip(st.display);
-    }
-
-    if (!st.compositor || !st.wm_base) {
-        fprintf(stderr, "Wayland compositor/wm_base missing\n");
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
+    plat_output_size(st.plat, &st.width, &st.height);
     if (st.width <= 0 || st.height <= 0) {
         st.width = 1280;
         st.height = 720;
     }
 
-    st.egl_display = eglGetDisplay((EGLNativeDisplayType)st.display);
-    if (st.egl_display == EGL_NO_DISPLAY || !eglInitialize(st.egl_display, NULL, NULL)) {
-        fprintf(stderr, "Failed to initialize EGL\n");
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    EGLint egl_attr[] = {
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_NONE
-    };
-    EGLConfig egl_cfg = NULL;
-    EGLint egl_num = 0;
-    if (!eglChooseConfig(st.egl_display, egl_attr, &egl_cfg, 1, &egl_num) || egl_num < 1) {
-        fprintf(stderr, "Failed to choose EGL config\n");
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
-    st.egl_context = eglCreateContext(st.egl_display, egl_cfg, EGL_NO_CONTEXT,
-                                      (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
-    if (st.egl_context == EGL_NO_CONTEXT) {
-        fprintf(stderr, "Failed to create EGL context\n");
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
     int target_fps = 60;
-    if (st.refresh_mhz > 0) {
-        int refresh = st.refresh_mhz / 1000;
+    int refresh_mhz = plat_refresh_mhz(st.plat);
+    if (refresh_mhz > 0) {
+        int refresh = refresh_mhz / 1000;
         if (refresh >= 15 && refresh <= 240) {
             target_fps = refresh;
         }
@@ -5500,134 +4933,25 @@ static int run_freerange_wayland(bool start_muted) {
     float frames_per_second = (float)target_fps;
 
     if (!init_audio(start_muted)) {
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
+        freerange_teardown(&st, &frames);
         return 1;
     }
 
-    FreedomFrameSet frames = {0};
     if (!make_basis_frames(&frames, frame_count, angle_period)) {
         fprintf(stderr, "Failed to generate ball frames\n");
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
+        freerange_teardown(&st, &frames);
         return 1;
     }
     st.frames_ref = &frames;
 
-    st.surface = wl_compositor_create_surface(st.compositor);
-    if (!st.surface) {
-        fprintf(stderr, "Failed to create Wayland surface\n");
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
+    if (!plat_window_create(st.plat, st.width, st.height)) {
+        freerange_teardown(&st, &frames);
         return 1;
     }
 
-    wl_surface_set_opaque_region(st.surface, NULL);
-
-    if (!ball_cursor_create(st.shm, st.compositor)) {
+    if (!ball_cursor_create(st.plat)) {
         fprintf(stderr, "Poingo: no ball cursor, using the default pointer\n");
     }
-
-    st.xdg_surface = xdg_wm_base_get_xdg_surface(st.wm_base, st.surface);
-    if (!st.xdg_surface) {
-        fprintf(stderr, "Failed to create xdg_surface\n");
-        ball_cursor_destroy();
-        wl_surface_destroy(st.surface);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
-    xdg_surface_add_listener(st.xdg_surface, &freerange_xdg_surface_listener, &st);
-    st.xdg_toplevel = xdg_surface_get_toplevel(st.xdg_surface);
-    if (!st.xdg_toplevel) {
-        fprintf(stderr, "Failed to create xdg_toplevel\n");
-        ball_cursor_destroy();
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-    xdg_toplevel_add_listener(st.xdg_toplevel, &freerange_toplevel_listener, &st);
-    xdg_toplevel_set_title(st.xdg_toplevel, "Poingo");
-    xdg_toplevel_set_app_id(st.xdg_toplevel, "poingo");
-    xdg_toplevel_set_maximized(st.xdg_toplevel);
-
-    st.egl_window = wl_egl_window_create(st.surface, st.width, st.height);
-    if (!st.egl_window) {
-        fprintf(stderr, "Failed to create EGL window\n");
-        ball_cursor_destroy();
-        xdg_toplevel_destroy(st.xdg_toplevel);
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
-    st.egl_surface = eglCreateWindowSurface(st.egl_display, egl_cfg,
-                                            (EGLNativeWindowType)st.egl_window, NULL);
-    if (st.egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "Failed to create EGL window surface\n");
-        ball_cursor_destroy();
-        wl_egl_window_destroy(st.egl_window);
-        xdg_toplevel_destroy(st.xdg_toplevel);
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-
-    if (!eglMakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context)) {
-        fprintf(stderr, "Failed to make EGL context current\n");
-        ball_cursor_destroy();
-        eglDestroySurface(st.egl_display, st.egl_surface);
-        wl_egl_window_destroy(st.egl_window);
-        xdg_toplevel_destroy(st.xdg_toplevel);
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        freerange_globals_destroy(&st);
-        return 1;
-    }
-    eglSwapInterval(st.egl_display, 0);
 
     uint32_t *light_drop = g_color_drop_light;
     uint32_t *dark_drop = g_color_drop_dark;
@@ -5675,80 +4999,25 @@ static int run_freerange_wayland(bool start_muted) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC pfn_swap_damage = NULL;
-    bool has_buffer_age = false;
-    {
-        const char *egl_exts = eglQueryString(st.egl_display, EGL_EXTENSIONS);
-        if (egl_exts) {
-            if (strstr(egl_exts, "EGL_KHR_swap_buffers_with_damage")) {
-                pfn_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)
-                    eglGetProcAddress("eglSwapBuffersWithDamageKHR");
-            } else if (strstr(egl_exts, "EGL_EXT_swap_buffers_with_damage")) {
-                pfn_swap_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)
-                    eglGetProcAddress("eglSwapBuffersWithDamageEXT");
-            }
-            has_buffer_age = strstr(egl_exts, "EGL_EXT_buffer_age") != NULL;
-        }
-        if (g_debug_mode) {
-            fprintf(stderr, "[egl] swap_with_damage=%s buffer_age=%s\n",
-                    pfn_swap_damage ? "yes" : "no",
-                    has_buffer_age ? "yes" : "no");
-        }
-    }
-
-    wl_surface_commit(st.surface);
-    while (!st.configured) {
-        if (wl_display_dispatch(st.display) < 0) {
-            break;
-        }
-    }
-    if (!st.configured) {
-        fprintf(stderr, "Never received the initial xdg_surface configure\n");
-        poingo_menu_destroy();
-        ball_cursor_destroy();
-        eglDestroySurface(st.egl_display, st.egl_surface);
-        wl_egl_window_destroy(st.egl_window);
-        xdg_toplevel_destroy(st.xdg_toplevel);
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        freerange_globals_destroy(&st);
+    if (!plat_window_show(st.plat)) {
+        freerange_teardown(&st, &frames);
         return 1;
     }
 
     if (st.resize_pending) {
-        wl_egl_window_resize(st.egl_window, st.width, st.height, 0, 0);
+        plat_surface_resize(st.plat, st.width, st.height);
         st.resize_pending = false;
     }
     glViewport(0, 0, st.width, st.height);
 
     if (!freerange_gl_init(&st, &frames)) {
         fprintf(stderr, "Failed to initialize GL resources\n");
-        poingo_menu_destroy();
-        freerange_gl_shutdown(&st);
-        ball_cursor_destroy();
-        eglDestroySurface(st.egl_display, st.egl_surface);
-        wl_egl_window_destroy(st.egl_window);
-        xdg_toplevel_destroy(st.xdg_toplevel);
-        xdg_surface_destroy(st.xdg_surface);
-        wl_surface_destroy(st.surface);
-        eglDestroyContext(st.egl_display, st.egl_context);
-        eglTerminate(st.egl_display);
-        freerange_color_regen_shutdown(&st);
-        freerange_destroy_frames(&frames);
-        release_sphere_pixel_cache();
-        shutdown_audio();
-        freerange_globals_destroy(&st);
+        freerange_teardown(&st, &frames);
         return 1;
     }
 
     /* Runtime colors are shader uniforms now; only the uploaded masks remain. */
-    free(frames.frames);
+    poingo_aligned_free(frames.frames);
     frames.frames = NULL;
 
     PoingoBall *first_ball = &st.balls[0];
@@ -5801,7 +5070,7 @@ static int run_freerange_wayland(bool start_muted) {
 
     bool  in_reg_ghost = false;
 
-    FrameCbData fr_cb = { .ready = true, .compositor_ms = 0 };
+    const PlatFrame *fr_cb = plat_frame(st.plat);
     uint32_t prev_compositor_ms = 0;
     bool     has_prev_compositor_ms = false;
     int obscured_frames = 0; 
@@ -5888,7 +5157,7 @@ static int run_freerange_wayland(bool start_muted) {
             clock_gettime(CLOCK_MONOTONIC, &_pe);
             pump_enter_ns = (uint64_t)_pe.tv_sec * 1000000000ULL + (uint64_t)_pe.tv_nsec;
         }
-        if (!freerange_pump_events(st.display, 20)) {
+        if (!plat_pump(st.plat, 20)) {
             /* The compositor is gone; there is nothing left to fade out to. */
             st.running = false;
             break;
@@ -5947,8 +5216,8 @@ static int run_freerange_wayland(bool start_muted) {
         if (sim_delta < 0.0) sim_delta = 0.0;
         if (sim_delta > 0.25) sim_delta = 0.25;
 
-        if (fr_cb.ready && has_prev_compositor_ms && fr_cb.compositor_ms != 0) {
-            uint32_t comp_delta_ms = fr_cb.compositor_ms - prev_compositor_ms; 
+        if (fr_cb->ready && has_prev_compositor_ms && fr_cb->presented_ms != 0) {
+            uint32_t comp_delta_ms = fr_cb->presented_ms - prev_compositor_ms;
             double comp_delta_s    = (double)comp_delta_ms * 0.001;
             if (comp_delta_s >= TARGET_FRAME_SECONDS * 1.5 &&
                 comp_delta_s <= TARGET_FRAME_SECONDS * 8.0) {
@@ -6017,7 +5286,7 @@ static int run_freerange_wayland(bool start_muted) {
         }
 
         if (st.resize_pending) {
-            wl_egl_window_resize(st.egl_window, st.width, st.height, 0, 0);
+            plat_surface_resize(st.plat, st.width, st.height);
             glViewport(0, 0, st.width, st.height);
             st.resize_pending = false;
             damage_hist_depth = 0;
@@ -6093,7 +5362,7 @@ static int run_freerange_wayland(bool start_muted) {
             }
         }
 
-        if (fr_cb.ready) {
+        if (fr_cb->ready) {
             bool ghost_changed = (st.ghost_mode != in_reg_ghost);
             if (!st.ball_cleared) {
                 freerange_update_input_region(&st);
@@ -6136,25 +5405,25 @@ static int run_freerange_wayland(bool start_muted) {
             }
             fr_last = fr_now;
 
-            if (g_debug_mode && fr_cb.delivery_ns != 0) {
+            if (g_debug_mode && fr_cb->delivered_ns != 0) {
                 struct timespec _noticed;
                 clock_gettime(CLOCK_MONOTONIC, &_noticed);
                 uint64_t noticed_ns = (uint64_t)_noticed.tv_sec * 1000000000ULL
                                     + (uint64_t)_noticed.tv_nsec;
 
-                double wake_us = (double)(int64_t)(noticed_ns - fr_cb.delivery_ns) / 1000.0;
+                double wake_us = (double)(int64_t)(noticed_ns - fr_cb->delivered_ns) / 1000.0;
 
-                uint64_t del_ms_mod = (fr_cb.delivery_ns / 1000000ULL) & 0xFFFFFFFFULL;
-                int32_t  cs_diff_ms = (int32_t)(del_ms_mod - (uint32_t)fr_cb.compositor_ms);
+                uint64_t del_ms_mod = (fr_cb->delivered_ns / 1000000ULL) & 0xFFFFFFFFULL;
+                int32_t  cs_diff_ms = (int32_t)(del_ms_mod - (uint32_t)fr_cb->presented_ms);
                 double   cstamp_off_us = cs_diff_ms * 1000.0;
 
                 double poll_wait_us = 0.0;
-                if (pump_enter_ns != 0 && fr_cb.delivery_ns >= pump_enter_ns) {
-                    poll_wait_us = (double)(fr_cb.delivery_ns - pump_enter_ns) / 1000.0;
+                if (pump_enter_ns != 0 && fr_cb->delivered_ns >= pump_enter_ns) {
+                    poll_wait_us = (double)(fr_cb->delivered_ns - pump_enter_ns) / 1000.0;
                 }
 
-                if (fcb_prev_del != 0 && fr_cb.delivery_ns > fcb_prev_del) {
-                    double interval_us = (double)(fr_cb.delivery_ns - fcb_prev_del) / 1000.0;
+                if (fcb_prev_del != 0 && fr_cb->delivered_ns > fcb_prev_del) {
+                    double interval_us = (double)(fr_cb->delivered_ns - fcb_prev_del) / 1000.0;
                     fcbi_n++;
                     double _d = interval_us - fcbi_mean;
                     fcbi_mean += _d / fcbi_n;
@@ -6181,11 +5450,11 @@ static int run_freerange_wayland(bool start_muted) {
 
                     if (fcb_log) {
                         fprintf(fcb_log, "%llu,%.1f,%.1f,%.1f,%.1f\n",
-                                (unsigned long long)fr_cb.delivery_ns,
+                                (unsigned long long)fr_cb->delivered_ns,
                                 interval_us, poll_wait_us, wake_us, cstamp_off_us);
                     }
                 }
-                fcb_prev_del = fr_cb.delivery_ns;
+                fcb_prev_del = fr_cb->delivered_ns;
 
                 double fcb_elapsed = (double)(fr_now - fcb_report_at)
                                    / (double)st.performance_frequency;
@@ -6212,12 +5481,12 @@ static int run_freerange_wayland(bool start_muted) {
             }
 
             if (has_prev_compositor_ms) {
-            } else if (fr_cb.compositor_ms != 0) {
-                prev_compositor_ms = fr_cb.compositor_ms;
+            } else if (fr_cb->presented_ms != 0) {
+                prev_compositor_ms = fr_cb->presented_ms;
                 has_prev_compositor_ms = true;
             }
 
-            (void)wayland_frame_request(st.surface, &fr_cb);
+            (void)plat_frame_request(st.plat);
 
             float render_extrap_dt = (float)(TARGET_FRAME_SECONDS - sim_delta);
             float extrap_cap = (float)(SNAP_THRESHOLD * 4.0);
@@ -6318,17 +5587,13 @@ static int run_freerange_wayland(bool start_muted) {
 
             bool repaint_full = true;
             FreerangeRect repaint = cur_rect;
-            if (has_buffer_age) {
-                EGLint age = 0;
-                if (eglQuerySurface(st.egl_display, st.egl_surface,
-                                    EGL_BUFFER_AGE_EXT, &age) &&
-                     age >= 1 && (int)age <= damage_hist_depth) {
-                    for (int i = 0; i < (int)age; i++) {
-                        freerange_rect_union(&repaint, &damage_hist[i]);
-                    }
-                    freerange_rect_clamp(&repaint, st.width, st.height);
-                    repaint_full = false;
+            int age = plat_buffer_age(st.plat);
+            if (age >= 1 && age <= damage_hist_depth) {
+                for (int i = 0; i < age; i++) {
+                    freerange_rect_union(&repaint, &damage_hist[i]);
                 }
+                freerange_rect_clamp(&repaint, st.width, st.height);
+                repaint_full = false;
             }
             if (!repaint_full) {
                 glEnable(GL_SCISSOR_TEST);
@@ -6600,27 +5865,14 @@ static int run_freerange_wayland(bool start_muted) {
                 gf_M2   += gd1 * (gf_ms - gf_mean);
                 if (gf_ms > gf_max) gf_max = gf_ms;
             }
-            if (pfn_swap_damage) {
-                FreerangeRect swap_dmg = cur_rect;
-                if (damage_hist_depth >= 1) {
-                    freerange_rect_union(&swap_dmg, &damage_hist[0]);
-                }
-                freerange_rect_clamp(&swap_dmg, st.width, st.height);
-                EGLint dmg[4];
-                EGLint n_dmg = 0;
-                if (damage_hist_depth >= 1 && swap_dmg.w > 0 && swap_dmg.h > 0) {
-                    dmg[0] = swap_dmg.x;
-                    dmg[1] = st.height - (swap_dmg.y + swap_dmg.h);
-                    dmg[2] = swap_dmg.w;
-                    dmg[3] = swap_dmg.h;
-                    n_dmg = 1;
-                }
-                pfn_swap_damage(st.egl_display, st.egl_surface,
-                                n_dmg ? dmg : NULL, n_dmg);
-            } else {
-                eglSwapBuffers(st.egl_display, st.egl_surface);
+            FreerangeRect swap_dmg = cur_rect;
+            if (damage_hist_depth >= 1) {
+                freerange_rect_union(&swap_dmg, &damage_hist[0]);
             }
-            wl_display_flush(st.display);
+            freerange_rect_clamp(&swap_dmg, st.width, st.height);
+            PlatRect dmg = { swap_dmg.x, swap_dmg.y, swap_dmg.w, swap_dmg.h };
+            bool dmg_known = damage_hist_depth >= 1 && swap_dmg.w > 0 && swap_dmg.h > 0;
+            plat_swap(st.plat, &dmg, dmg_known ? 1 : 0);
 
             for (int i = FREERANGE_DAMAGE_HISTORY - 1; i > 0; i--) {
                 damage_hist[i] = damage_hist[i - 1];
@@ -6630,8 +5882,8 @@ static int run_freerange_wayland(bool start_muted) {
                 damage_hist_depth++;
             }
 
-            if (fr_cb.compositor_ms != 0) {
-                prev_compositor_ms = fr_cb.compositor_ms;
+            if (fr_cb->presented_ms != 0) {
+                prev_compositor_ms = fr_cb->presented_ms;
                 has_prev_compositor_ms = true;
             }
 
@@ -6669,10 +5921,7 @@ static int run_freerange_wayland(bool start_muted) {
 
         } else {
             if (++obscured_frames % 300 == 0) {
-                if (wayland_frame_request(st.surface, &fr_cb)) {
-                    wl_surface_commit(st.surface);
-                    wl_display_flush(st.display);
-                }
+                plat_frame_poke(st.plat);
             }
         }
     } 
@@ -6719,43 +5968,7 @@ static int run_freerange_wayland(bool start_muted) {
         fclose(fcb_log);
     }
 
-    wayland_frame_cancel(&fr_cb);
-    poingo_menu_destroy();
-    freerange_gl_shutdown(&st);
-    if (st.egl_surface != EGL_NO_SURFACE) {
-        eglDestroySurface(st.egl_display, st.egl_surface);
-    }
-    if (st.egl_window) {
-        wl_egl_window_destroy(st.egl_window);
-    }
-    if (st.egl_context != EGL_NO_CONTEXT) {
-        eglDestroyContext(st.egl_display, st.egl_context);
-    }
-    if (st.egl_display != EGL_NO_DISPLAY) {
-        eglTerminate(st.egl_display);
-    }
-
-    /* Its surface and buffers must die before their globals and display. */
-    ball_cursor_destroy();
-
-    if (st.xdg_toplevel) {
-        xdg_toplevel_destroy(st.xdg_toplevel);
-    }
-    if (st.xdg_surface) {
-        xdg_surface_destroy(st.xdg_surface);
-    }
-    if (st.surface) {
-        wl_surface_destroy(st.surface);
-    }
-    freerange_globals_destroy(&st);
-
-    freerange_color_regen_shutdown(&st);
-    freerange_destroy_frames(&frames);
-    shutdown_audio();
-    free(st.regen_unit_done_storage);
-    free(st.regen_order_storage);
-    free(st.regen_thread_storage);
-    release_sphere_pixel_cache();
+    freerange_teardown(&st, &frames);
     return 0;
 }
 
@@ -6855,11 +6068,5 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    const char *wayland_display_env = getenv("WAYLAND_DISPLAY");
-    if (!wayland_display_env || wayland_display_env[0] == '\0') {
-        fprintf(stderr, "poingo requires a Wayland compositor (WAYLAND_DISPLAY is not set).\n");
-        return 1;
-    }
-
-    return run_freerange_wayland(start_muted);
+    return run_freerange(start_muted);
 }

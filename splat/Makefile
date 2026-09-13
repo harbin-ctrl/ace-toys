@@ -1,105 +1,134 @@
 ifeq ($(origin CC),default)
+ifneq ($(OS)$(MSYSTEM),)
+CC := gcc
+else
 CC := ccache gcc
+endif
 endif
 CCACHE_PREFIX ?= distcc
 export CC CCACHE_PREFIX
+
+# The window system and audio backend follow the host: Win32 and WASAPI on
+# Windows, Wayland and PipeWire everywhere else. See ../toy-platform.
+include $(CURDIR)/../toy-platform/platform.mk
+
 RINGMENU_DIR ?= $(CURDIR)/../ring-menu
 TOYAUDIO_DIR ?= $(CURDIR)/../toy-audio
 ACE_DIR ?= $(CURDIR)/../ace-packaging
 RINGMENU_LIB := $(RINGMENU_DIR)/libringmenu.a
 TOYAUDIO_LIB := $(TOYAUDIO_DIR)/libtoyaudio.a
-SPLAT_SRC := splat.c xdg-shell-protocol.c
+SPLAT_SRC := splat.c
 ICON_SRC := icon_maker.c
 GHOSTICON_DIR := $(CURDIR)/../shared
 GHOSTICON_LIB := $(GHOSTICON_DIR)/libghosticon.a
 # lodepng is only for icon_maker, which encodes the .png desktop icons at
 # build time. The toy itself decodes nothing.
 LODEPNG_LIB := $(CURDIR)/../third_party/lodepng/liblodepng.a
-TARGETS := splat icon_maker
+TARGETS := splat$(EXE) icon_maker$(EXE)
+ifeq ($(PLATFORM),win32)
+# The icon, embedded so the taskbar, Explorer and the shortcut all show it.
+SPLAT_RES := splat_res.o
+else
+SPLAT_RES :=
+endif
 
 ICON_SIZES := 32 48 64 128 192 256 512 1024
 ICON_PNGS := $(addprefix icon_,$(addsuffix .png,$(ICON_SIZES)))
 
 PREFIX ?= /usr/local
-PKG_CONFIG ?= pkg-config
 
 include $(ACE_DIR)/install.mk
-include $(TOYAUDIO_DIR)/pipewire.mk
 
-# Spray is a pure-Wayland client: Wayland + EGL/GLES for the overlay and
-# PipeWire for the spray-can hiss. No SDL, no toolkit.
-WAYLAND_CFLAGS := $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl egl glesv2 2>/dev/null)
-WAYLAND_LIBS := $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl egl glesv2 2>/dev/null)
-ifeq ($(strip $(WAYLAND_LIBS)),)
-WAYLAND_LIBS := -lwayland-client -lwayland-egl -lEGL -lGLESv2
+ifeq ($(PLATFORM),win32)
+WIN_DIR ?= $(CURDIR)/../win-packaging
+WINDRES ?= windres
+include $(WIN_DIR)/install.mk
+include $(TOYAUDIO_DIR)/wasapi.mk
+TOY_AUDIO_CFLAGS := $(TOY_AUDIO_WASAPI_CFLAGS)
+TOY_AUDIO_LIBS := $(TOY_AUDIO_WASAPI_LIBS)
+else
+include $(TOYAUDIO_DIR)/pipewire.mk
+TOY_AUDIO_CFLAGS := $(TOY_AUDIO_PIPEWIRE_CFLAGS)
+TOY_AUDIO_LIBS := $(TOY_AUDIO_PIPEWIRE_LIBS)
 endif
 
 # The paint rasterizer is hot float loops; build vectorization-friendly but
 # portable (no -mcpu=native, so the binary can be packaged for other machines).
 CFLAGS := -std=c11 -Wall -Wextra -Wshadow -pedantic -D_GNU_SOURCE -D_DEFAULT_SOURCE \
           -O3 -ffast-math -funroll-loops -fPIC -I$(CURDIR) -I$(RINGMENU_DIR) \
-          -I$(TOYAUDIO_DIR) -I$(GHOSTICON_DIR) $(WAYLAND_CFLAGS) $(TOY_AUDIO_PIPEWIRE_CFLAGS)
-LDFLAGS := $(WAYLAND_LIBS) $(TOY_AUDIO_PIPEWIRE_LIBS) -lm -lpthread
+          -I$(TOYAUDIO_DIR) -I$(GHOSTICON_DIR) $(TOY_PLATFORM_CFLAGS) $(TOY_AUDIO_CFLAGS)
+LDFLAGS := $(TOY_PLATFORM_LIBS) $(TOY_AUDIO_LIBS) -lm -lpthread
+TOY_LIBS := $(RINGMENU_LIB) $(TOYAUDIO_LIB) $(GHOSTICON_LIB) $(TOYPLATFORM_LIB)
 
-.PHONY: all clean run icons install uninstall test
+.PHONY: all clean run icons install uninstall stage test
 
 all: $(TARGETS)
 
-# Wayland protocol glue is generated, not checked in.
-WAYLAND_PROTOCOLS_DIR := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols 2>/dev/null || echo /usr/share/wayland-protocols)
-WAYLAND_SCANNER := $(shell command -v wayland-scanner 2>/dev/null || echo wayland-scanner)
-
-xdg-shell-client-protocol.h:
-	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS_DIR)/stable/xdg-shell/xdg-shell.xml $@
-
-xdg-shell-protocol.c:
-	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS_DIR)/stable/xdg-shell/xdg-shell.xml $@
-
-splat.o: xdg-shell-client-protocol.h $(RINGMENU_DIR)/ringmenu.h \
+splat.o: $(RINGMENU_DIR)/ringmenu.h \
 		$(TOYAUDIO_DIR)/toy_audio.h $(TOYAUDIO_DIR)/toy_audio_stream.h \
-		$(GHOSTICON_DIR)/ghost_icon.h
+		$(GHOSTICON_DIR)/ghost_icon.h $(TOYPLATFORM_DIR)/platform.h spraycan.h
 
-# The ring menu and audio core live in their own library checkouts; delegate
-# so they rebuild whenever their sources change.
+# The ring menu, audio core and platform layer live in their own library
+# checkouts; delegate so they rebuild whenever their sources change.
 $(RINGMENU_LIB): FORCE
 	$(MAKE) -C $(RINGMENU_DIR)
 $(TOYAUDIO_LIB): FORCE
 	$(MAKE) -C $(TOYAUDIO_DIR)
 $(GHOSTICON_LIB): FORCE
 	$(MAKE) -C $(GHOSTICON_DIR)
+$(TOYPLATFORM_LIB): FORCE
+	$(MAKE) -C $(TOYPLATFORM_DIR)
 FORCE:
 
-splat: $(SPLAT_SRC:.c=.o) $(RINGMENU_LIB) $(TOYAUDIO_LIB) $(GHOSTICON_LIB)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+splat$(EXE): $(SPLAT_SRC:.c=.o) $(SPLAT_RES) $(TOY_LIBS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(APP_LDFLAGS)
 
 icon_maker.o: CFLAGS := -std=c99 -O2 -I$(CURDIR) -I$(CURDIR)/../third_party/lodepng
 $(LODEPNG_LIB): FORCE
 	$(MAKE) -C $(CURDIR)/../third_party/lodepng
-icon_maker: icon_maker.o $(LODEPNG_LIB)
+icon_maker$(EXE): icon_maker.o $(LODEPNG_LIB)
 	$(CC) -O2 $^ -o $@ -lm
 
-icons: icon_maker
-	./icon_maker
+icons: icon_maker$(EXE)
+	./icon_maker$(EXE)
 
-run: splat
-	./splat
+run: splat$(EXE)
+	./splat$(EXE)
 
 # Offscreen engine test: includes splat.c directly and writes PNGs of a
 # simulated session (spray, mixing, eraser, cursor art) plus checks.
-test: test_engine
-	cd $(CURDIR) && ./test_engine
+test: test_engine$(EXE)
+	cd $(CURDIR) && ./test_engine$(EXE)
 
-test_engine: test_engine.c splat.c spraycan.h \
-		xdg-shell-client-protocol.h $(RINGMENU_LIB) \
-		xdg-shell-protocol.o $(LODEPNG_LIB) $(TOYAUDIO_LIB) \
-		$(GHOSTICON_LIB)
+test_engine$(EXE): test_engine.c splat.c spraycan.h $(LODEPNG_LIB) $(TOY_LIBS)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I$(CURDIR) -I$(RINGMENU_DIR) \
 		-I$(TOYAUDIO_DIR) -I$(GHOSTICON_DIR) -I$(CURDIR)/../third_party/lodepng \
-		$(TOY_AUDIO_PIPEWIRE_CFLAGS) test_engine.c \
-		$(RINGMENU_LIB) xdg-shell-protocol.o $(LODEPNG_LIB) \
-		$(TOYAUDIO_LIB) $(GHOSTICON_LIB) -o $@ $(WAYLAND_LIBS) \
-		$(TOY_AUDIO_PIPEWIRE_LIBS) -lm -lpthread
+		$(TOY_PLATFORM_CFLAGS) $(TOY_AUDIO_CFLAGS) test_engine.c \
+		$(LODEPNG_LIB) $(TOY_LIBS) -o $@ $(LDFLAGS)
 
+ifeq ($(PLATFORM),win32)
+# One per-user win-toys folder and a shortcut in the Start menu's Ace folder,
+# as the ace-toys package installs on Linux. See win-packaging/install.mk.
+install: splat$(EXE)
+	$(call win_install,splat,Splat,splat$(EXE))
+
+uninstall:
+	$(call win_uninstall,splat,Splat)
+
+# Into the package the root Makefile's `package` builds.
+stage: splat$(EXE)
+	$(call win_stage,splat,Splat,splat$(EXE),$(DESTDIR))
+
+# An .ico entry holds at most 256 px.
+ICO_SIZES := 32 48 64 128 256
+
+splat.ico: icon_maker$(EXE)
+	./icon_maker$(EXE)
+	$(call win_ico,$@,$(addprefix icon_,$(addsuffix .png,$(ICO_SIZES))))
+
+splat_res.o: splat.rc splat.ico
+	$(WINDRES) $< -O coff -o $@
+else
 # The caches are refreshed only for a live install. A staged one (DESTDIR,
 # as in a package build) would otherwise ship system-wide caches; the
 # package's triggers refresh the real ones.
@@ -128,10 +157,11 @@ uninstall: ace-uninstall
 		update-desktop-database "$(DESTDIR)$(PREFIX)/share/applications" 2>/dev/null || true; \
 		gtk-update-icon-cache -f -q "$(DESTDIR)$(PREFIX)/share/icons/hicolor" 2>/dev/null || true; \
 	fi
+endif
 
 clean:
-	$(RM) $(TARGETS) test_engine $(SPLAT_SRC:.c=.o) icon_maker.o test_engine.o $(LODEPNG_LIB) $(ICON_PNGS)
-	$(RM) xdg-shell-client-protocol.h xdg-shell-protocol.c
+	$(RM) $(TARGETS) test_engine$(EXE) $(SPLAT_SRC:.c=.o) icon_maker.o test_engine.o $(LODEPNG_LIB) $(ICON_PNGS)
+	$(RM) xdg-shell-client-protocol.h xdg-shell-protocol.c splat.ico splat_res.o
 	$(RM) test_*.png
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
