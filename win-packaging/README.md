@@ -3,29 +3,34 @@
 The Windows packaging of the toys: the win-toys counterpart of
 `ace-packaging` and the `ace-toys` Debian package.
 
-`make install` at the repository root, in an MSYS2 CLANGARM64 shell, builds
-every ported toy and installs it for the current user. No administrator
-rights are needed.
+Each toy has its own per-user installer, for ARM64 and x64 Windows. No
+administrator rights are needed.
 
-- `%LOCALAPPDATA%\Programs\win-toys\` — each toy's `.exe`, beside the MSYS2
-  runtime DLLs they load (ANGLE, libc++, zlib, winpthread).
-- Start menu → `Ace` → one shortcut per toy, as Linux has an Ace menu.
+- `%LOCALAPPDATA%\Programs\Ace\<toy>\` — the toy's `.exe`, beside the MSYS2
+  runtime DLLs it loads (ANGLE, libc++, zlib, winpthread).
+- Start menu → `Ace` → the toy's shortcut, as Linux has an Ace menu.
+- Settings → Apps → Installed apps lists it, with its uninstaller.
 
-`make uninstall` removes them. The shared folder and the Ace folder go with
-the last toy.
+At the repository root, in an MSYS2 CLANGARM64 shell with the CLANG64
+toolchain and [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed:
 
-`make package` builds the distributable, as `make deb` does on Linux:
-`../win-toys_<version>_<arch>.zip`, version from `debian/changelog`. It holds
-every toy, their DLLs, `install.cmd`, `uninstall.cmd` and `README.txt`.
-`make install` builds that package and installs from it.
+- `make installer` — `installer/<toy>-<version>-setup.exe` per toy, version
+  from `debian/changelog`. Build on ARM64 Windows; it runs the x64 toolchain
+  under emulation.
+- `make install` — runs them silently, first removing any copy the old zip
+  package installed in `%LOCALAPPDATA%\Programs\win-toys\`.
+- `make uninstall` — runs their uninstallers.
 
-- `install.mk` — make fragment with `win_install`, `win_uninstall`,
-  `win_stage` and `win_ico`; see its header comment for usage.
-- `install.ps1` — the per-user install and removal, of one toy or of a
-  whole package.
-- `install.cmd`, `uninstall.cmd`, `README.txt` — shipped in the package.
+The same targets work in one toy's directory.
+
+- `installer.mk` — make fragment building one toy's installer; see its header.
+- `toy.iss` — the Inno Setup script every toy's installer is built from.
+- `install.mk` — `win_uninstall` (removes a pre-installer copy) and `win_ico`.
+- `remove-old-install.ps1` — that removal.
 - `make-ico.ps1` — packs a toy's PNG icons into the `.ico` its resource file
   embeds.
+- `test-installers.ps1` — installs, upgrades, uninstalls and installs the x64
+  build of each toy on this machine.
 
 A toy launched from the Start menu has no console, so it writes stderr to
 `%LOCALAPPDATA%\<toy>\session.log`, as `poingo-logged` does on Linux.

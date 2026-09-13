@@ -35,5 +35,6 @@ compile_commands.json
 *.exe
 /*/*.ico
 
-# The Windows package staging tree; the zip itself lands beside the repository.
-/win-packaging/stage/
+# The Windows installers, and the per-architecture builds they come from.
+/installer/
+/build/

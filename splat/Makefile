@@ -107,17 +107,11 @@ test_engine$(EXE): test_engine.c splat.c spraycan.h $(LODEPNG_LIB) $(TOY_LIBS)
 		$(LODEPNG_LIB) $(TOY_LIBS) -o $@ $(LDFLAGS)
 
 ifeq ($(PLATFORM),win32)
-# One per-user win-toys folder and a shortcut in the Start menu's Ace folder,
-# as the ace-toys package installs on Linux. See win-packaging/install.mk.
-install: splat$(EXE)
-	$(call win_install,splat,Splat,splat$(EXE))
-
-uninstall:
-	$(call win_uninstall,splat,Splat)
-
-# Into the package the root Makefile's `package` builds.
-stage: splat$(EXE)
-	$(call win_stage,splat,Splat,splat$(EXE),$(DESTDIR))
+# A per-user installer, for ARM64 and x64, with a shortcut in the Start menu's
+# Ace folder. See win-packaging/installer.mk.
+WIN_TOY := splat
+WIN_TOY_NAME := Splat
+include $(WIN_DIR)/installer.mk
 
 # An .ico entry holds at most 256 px.
 ICO_SIZES := 32 48 64 128 256

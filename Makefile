@@ -39,7 +39,7 @@ LINT_SOURCES := \
 LINT_INCLUDES := -Itoy-audio -Iring-menu -Ishared -Isplat -Ipoingo -Iballoons -Ithird_party/lodepng
 TIDY_SOURCES := $(addprefix $(CURDIR)/,$(LINT_SOURCES))
 
-.PHONY: all libs clean install stage-install uninstall deb debs package \
+.PHONY: all libs clean install stage-install uninstall deb debs installer \
 	$(LIBS) $(TOYS) lint cppcheck analyzer tidy compile_commands.json
 
 all: $(TOYS)
@@ -55,6 +55,7 @@ $(TOYS): libs
 
 clean:
 	@for d in $(LIBS) $(TOYS); do $(MAKE) -C $$d clean; done
+	$(RM) -r build installer
 
 stage-install:
 	@for d in $(TOYS); do $(MAKE) -C $$d install || exit $$?; done
@@ -67,28 +68,13 @@ deb:
 debs: deb
 
 ifneq ($(OS)$(MSYSTEM),)
-# Windows: the win-toys package, a zip beside the repository as the .deb is.
+# Windows: one installer per toy, for ARM64 and x64, in installer/.
 # See win-packaging/README.md.
-WIN_VERSION := $(shell sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p' debian/changelog)
-WIN_ARCH := $(if $(filter aarch64,$(MSYSTEM_CARCH)),arm64,$(if $(filter x86_64,$(MSYSTEM_CARCH)),x64,$(MSYSTEM_CARCH)))
-WIN_PACKAGE := win-toys_$(WIN_VERSION)_$(WIN_ARCH)
-WIN_STAGE := $(CURDIR)/win-packaging/stage
-WIN_PACKAGE_DIR := $(WIN_STAGE)/$(WIN_PACKAGE)
-WIN_PACKAGE_ZIP := $(abspath $(CURDIR)/../$(WIN_PACKAGE).zip)
-WIN_POWERSHELL := powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File
+installer: $(TOYS)
+	@for d in $(TOYS); do $(MAKE) -C $$d installer || exit $$?; done
 
-package: $(TOYS)
-	rm -rf "$(WIN_STAGE)"
-	@for d in $(TOYS); do $(MAKE) -C $$d stage DESTDIR="$(WIN_PACKAGE_DIR)" || exit $$?; done
-	cp win-packaging/install.ps1 win-packaging/install.cmd win-packaging/uninstall.cmd \
-		win-packaging/README.txt "$(WIN_PACKAGE_DIR)/"
-	rm -f "$(WIN_PACKAGE_ZIP)"
-	bsdtar -a -cf "$(WIN_PACKAGE_ZIP)" -C "$(WIN_STAGE)" "$(WIN_PACKAGE)"
-	@echo "package: $(WIN_PACKAGE_ZIP)"
-
-# Installs from the package, as Linux installs the .deb.
-install: package
-	$(WIN_POWERSHELL) "$$(cygpath -w "$(WIN_PACKAGE_DIR)/install.ps1")" -Action InstallAll
+install: $(TOYS)
+	@for d in $(TOYS); do $(MAKE) -C $$d install || exit $$?; done
 
 uninstall:
 	@for d in $(TOYS); do $(MAKE) -C $$d uninstall || exit $$?; done
