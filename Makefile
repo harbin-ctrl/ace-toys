@@ -39,7 +39,7 @@ LINT_SOURCES := \
 LINT_INCLUDES := -Itoy-audio -Iring-menu -Ishared -Isplat -Ipoingo -Iballoons -Ithird_party/lodepng
 TIDY_SOURCES := $(addprefix $(CURDIR)/,$(LINT_SOURCES))
 
-.PHONY: all libs clean install stage-install uninstall deb debs installer \
+.PHONY: all libs clean install stage-install uninstall deb debs inno \
 	$(LIBS) $(TOYS) lint cppcheck analyzer tidy compile_commands.json
 
 all: $(TOYS)
@@ -70,8 +70,8 @@ debs: deb
 ifneq ($(OS)$(MSYSTEM),)
 # Windows: one installer per toy, for ARM64 and x64, in installer/.
 # See win-packaging/README.md.
-installer: $(TOYS)
-	@for d in $(TOYS); do $(MAKE) -C $$d installer || exit $$?; done
+inno: $(TOYS)
+	@for d in $(TOYS); do $(MAKE) -C $$d inno || exit $$?; done
 
 install: $(TOYS)
 	@for d in $(TOYS); do $(MAKE) -C $$d install || exit $$?; done

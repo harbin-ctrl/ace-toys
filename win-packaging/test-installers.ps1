@@ -1,5 +1,5 @@
 # Tests the toys' installers on this machine: install, upgrade while running,
-# uninstall, and the x64 build. Run after `make installer` at the repository
+# uninstall, and the x64 build. Run after `make inno` at the repository
 # root:
 #
 #   powershell -ExecutionPolicy Bypass -File win-packaging\test-installers.ps1 [-Toys poingo,splat]

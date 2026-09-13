@@ -14,9 +14,9 @@ administrator rights are needed.
 At the repository root, in an MSYS2 CLANGARM64 shell with the CLANG64
 toolchain and [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed:
 
-- `make installer` — `installer/<toy>-<version>-setup.exe` per toy, version
-  from `debian/changelog`. Build on ARM64 Windows; it runs the x64 toolchain
-  under emulation.
+- `make inno` — the ready-to-ship `installer/<toy>-<version>-setup.exe` per
+  toy, version from `debian/changelog`. Build on ARM64 Windows; it runs the
+  x64 toolchain under emulation.
 - `make install` — runs them silently, first removing any copy the old zip
   package installed in `%LOCALAPPDATA%\Programs\win-toys\`.
 - `make uninstall` — runs their uninstallers.

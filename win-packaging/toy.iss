@@ -1,5 +1,5 @@
 ; Per-user installer for one toy, on ARM64 or x64 Windows; it installs the
-; build that matches. Built by the toy's `make installer` (installer.mk), which
+; build that matches. Built by the toy's `make inno` (installer.mk), which
 ; defines:
 ;
 ;   Toy         program and folder name     poingo

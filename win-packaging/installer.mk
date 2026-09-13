@@ -7,7 +7,7 @@
 #
 # after install.mk, with a rule for $(WIN_TOY).ico and a FORCE target. Then:
 #
-#   make installer   ../installer/<toy>-<version>-setup.exe (toy.iss)
+#   make inno        ../installer/<toy>-<version>-setup.exe (toy.iss)
 #   make install     runs it silently, replacing a pre-installer copy
 #   make uninstall   runs its uninstaller
 #
@@ -39,9 +39,9 @@ win_env = MSYSTEM=$(if $(filter x64,$(1)),CLANG64,CLANGARM64) \
 	MSYSTEM_CARCH=$(if $(filter x64,$(1)),x86_64,aarch64) \
 	PATH="$(call win_prefix,$(1))/bin:$$PATH"
 
-.PHONY: installer
+.PHONY: inno
 
-installer: $(addprefix installer-stage-,$(WIN_ARCHES)) $(WIN_TOY).ico
+inno: $(addprefix inno-stage-,$(WIN_ARCHES)) $(WIN_TOY).ico
 	$(WIN_NO_ARGCONV) "$(WIN_ISCC)" /Q "/DToy=$(WIN_TOY)" "/DName=$(WIN_TOY_NAME)" \
 		"/DAppVersion=$(WIN_VERSION)" "/DStage=$$(cygpath -w "$(WIN_STAGE)")" \
 		"/DIcon=$$(cygpath -w "$(CURDIR)/$(WIN_TOY).ico")" "/O$$(cygpath -w "$(WIN_OUT)")" \
@@ -49,7 +49,7 @@ installer: $(addprefix installer-stage-,$(WIN_ARCHES)) $(WIN_TOY).ico
 	@echo "installer: $(WIN_OUT)/$(WIN_SETUP).exe"
 
 # $(WIN_STAGE)/<arch>: the program and the runtime DLLs it loads.
-installer-stage-%: FORCE
+inno-stage-%: FORCE
 	rm -rf "$(WIN_BUILD)/$*/$(WIN_TOY)" "$(WIN_STAGE)/$*"
 	mkdir -p "$(WIN_BUILD)/$*/$(WIN_TOY)" "$(WIN_STAGE)/$*"
 	tar -c -C "$(WIN_REPO)" $(WIN_COPY_EXCLUDES) $(WIN_SOURCE_DIRS) | tar -x -C "$(WIN_BUILD)/$*/$(WIN_TOY)"
@@ -61,7 +61,7 @@ installer-stage-%: FORCE
 		awk -v prefix="$(call win_prefix,$*)/" 'index($$3, prefix) == 1 { print $$3 }' | \
 		sort -u | xargs -r -I{} cp {} "$(WIN_STAGE)/$*/"
 
-install: installer
+install: inno
 	$(call win_uninstall,$(WIN_TOY),$(WIN_TOY_NAME))
 	$(WIN_NO_ARGCONV) "$(WIN_OUT)/$(WIN_SETUP).exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS
 
