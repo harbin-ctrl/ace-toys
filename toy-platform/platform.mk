@@ -23,10 +23,10 @@ APP_LDFLAGS := -mwindows
 else
 PLATFORM := wayland
 EXE :=
-TOY_PLATFORM_BACKEND_CFLAGS := $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl egl glesv2 2>/dev/null)
-TOY_PLATFORM_LIBS := $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl egl glesv2 2>/dev/null)
+TOY_PLATFORM_BACKEND_CFLAGS := $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl egl glesv2 xkbcommon 2>/dev/null)
+TOY_PLATFORM_LIBS := $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl egl glesv2 xkbcommon 2>/dev/null)
 ifeq ($(strip $(TOY_PLATFORM_LIBS)),)
-TOY_PLATFORM_LIBS := -lwayland-client -lwayland-egl -lEGL -lGLESv2
+TOY_PLATFORM_LIBS := -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lxkbcommon
 endif
 APP_LDFLAGS :=
 endif

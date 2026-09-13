@@ -58,12 +58,14 @@ enum {
     WIN_SC_ESC = 0x01,
     WIN_SC_1 = 0x02,
     WIN_SC_9 = 0x0A,
+    WIN_SC_BACKSPACE = 0x0E,
     WIN_SC_Q = 0x10,
     WIN_SC_E = 0x12,
     WIN_SC_T = 0x14,
     WIN_SC_P = 0x19,
     WIN_SC_LEFTBRACE = 0x1A,
     WIN_SC_RIGHTBRACE = 0x1B,
+    WIN_SC_ENTER = 0x1C,
     WIN_SC_A = 0x1E,
     WIN_SC_C = 0x2E,
     WIN_SC_M = 0x32,
@@ -113,6 +115,7 @@ struct Plat {
     int pointer_x;
     int pointer_y;
     int buttons_held;
+    wchar_t high_surrogate;
 
     PlatRect *region;
     int region_count;
@@ -150,6 +153,10 @@ static PlatKey win_key(LPARAM lp)
     switch (scan) {
     case WIN_SC_ESC:
         return PLAT_KEY_ESC;
+    case WIN_SC_ENTER:
+        return PLAT_KEY_ENTER;
+    case WIN_SC_BACKSPACE:
+        return PLAT_KEY_BACKSPACE;
     case WIN_SC_Q:
         return PLAT_KEY_Q;
     case WIN_SC_E:
@@ -173,6 +180,38 @@ static PlatKey win_key(LPARAM lp)
     default:
         return PLAT_KEY_OTHER;
     }
+}
+
+static void win_text(Plat *p, wchar_t input)
+{
+    wchar_t utf16[2];
+    int utf16_length = 1;
+    if (input >= 0xD800 && input <= 0xDBFF) {
+        p->high_surrogate = input;
+        return;
+    }
+    if (input >= 0xDC00 && input <= 0xDFFF) {
+        if (!p->high_surrogate) {
+            return;
+        }
+        utf16[0] = p->high_surrogate;
+        utf16[1] = input;
+        utf16_length = 2;
+        p->high_surrogate = 0;
+    } else {
+        p->high_surrogate = 0;
+        utf16[0] = input;
+    }
+
+    char utf8[8];
+    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, utf16,
+                                     utf16_length, utf8, sizeof(utf8) - 1,
+                                     NULL, NULL);
+    if (length <= 0) {
+        return;
+    }
+    utf8[length] = '\0';
+    p->handlers.text(p->userdata, utf8);
 }
 
 static bool win_region_has(const Plat *p, int x, int y)
@@ -372,6 +411,11 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_KEYUP:
         p->handlers.key(p->userdata, win_key(lp), PLAT_RELEASED);
+        return 0;
+    case WM_CHAR:
+        if (p->handlers.text && wp >= 0x20 && wp != 0x7F) {
+            win_text(p, (wchar_t)wp);
+        }
         return 0;
     case WM_KILLFOCUS:
         p->handlers.keyboard_lost(p->userdata);

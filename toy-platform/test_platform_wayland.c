@@ -19,6 +19,7 @@ static int g_failures = 0;
 
 static int g_keyboard_lost = 0;
 static int g_pointer_lost = 0;
+static char g_text[16];
 
 static void on_enter(void *userdata, int x, int y)
 {
@@ -58,6 +59,12 @@ static void on_key(void *userdata, PlatKey key, PlatPress press)
     (void)press;
 }
 
+static void on_text(void *userdata, const char *utf8)
+{
+    (void)userdata;
+    snprintf(g_text, sizeof(g_text), "%s", utf8);
+}
+
 static void on_keyboard_lost(void *userdata)
 {
     (void)userdata;
@@ -79,6 +86,7 @@ static const PlatHandlers test_handlers = {
     .pointer_scroll = on_scroll,
     .pointer_lost = on_pointer_lost,
     .key = on_key,
+    .text = on_text,
     .keyboard_lost = on_keyboard_lost,
     .resize = on_resize,
     .close = on_leave,
@@ -92,7 +100,28 @@ static Plat test_plat(void)
     };
     g_keyboard_lost = 0;
     g_pointer_lost = 0;
+    g_text[0] = '\0';
     return p;
+}
+
+static void test_keyboard_text(void)
+{
+    Plat p = test_plat();
+    p.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    p.xkb_keymap = xkb_keymap_new_from_names(p.xkb_context, NULL,
+                   XKB_KEYMAP_COMPILE_NO_FLAGS);
+    p.xkb_state = xkb_state_new(p.xkb_keymap);
+
+    way_keyboard_key(&p, NULL, 0, 0, KEY_A,
+                     WL_KEYBOARD_KEY_STATE_PRESSED);
+    CHECK(strcmp(g_text, "a") == 0, "key text was '%s'", g_text);
+    CHECK(way_key(KEY_ENTER) == PLAT_KEY_ENTER, "enter was not mapped");
+    CHECK(way_key(KEY_BACKSPACE) == PLAT_KEY_BACKSPACE,
+          "backspace was not mapped");
+
+    xkb_state_unref(p.xkb_state);
+    xkb_keymap_unref(p.xkb_keymap);
+    xkb_context_unref(p.xkb_context);
 }
 
 /* A hidden surface must keep at most one outstanding frame callback. */
@@ -172,6 +201,7 @@ static void test_cursor_failure_cleans_storage(void)
 
 int main(void)
 {
+    test_keyboard_text();
     test_frame_callback_single_flight();
     test_capability_loss_reported();
     test_registry_remove_clears_slots();

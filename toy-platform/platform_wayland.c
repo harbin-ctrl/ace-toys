@@ -22,6 +22,7 @@
 
 #include <wayland-client.h>
 #include <wayland-egl.h>
+#include <xkbcommon/xkbcommon.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include "xdg-shell-client-protocol.h"
@@ -59,6 +60,9 @@ struct Plat {
     struct wl_seat *seat;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+    struct xkb_context *xkb_context;
+    struct xkb_keymap *xkb_keymap;
+    struct xkb_state *xkb_state;
     struct wl_output *output;
     struct xdg_wm_base *wm_base;
     struct zxdg_decoration_manager_v1 *deco_manager;
@@ -118,6 +122,10 @@ static PlatKey way_key(uint32_t key)
         return PLAT_KEY_Q;
     case KEY_ESC:
         return PLAT_KEY_ESC;
+    case KEY_ENTER:
+        return PLAT_KEY_ENTER;
+    case KEY_BACKSPACE:
+        return PLAT_KEY_BACKSPACE;
     case KEY_M:
         return PLAT_KEY_M;
     case KEY_A:
@@ -342,13 +350,38 @@ static const struct wl_pointer_listener way_pointer_listener = {
 static void way_keyboard_keymap(void *data, struct wl_keyboard *keyboard,
                                 uint32_t format, int fd, uint32_t size)
 {
-    (void)data;
     (void)keyboard;
-    (void)format;
-    (void)size;
-    if (fd >= 0) {
-        close(fd);
+    Plat *p = data;
+    if (fd < 0) {
+        return;
     }
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
+        close(fd);
+        return;
+    }
+
+    char *source = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (source == MAP_FAILED) {
+        return;
+    }
+    struct xkb_keymap *keymap = xkb_keymap_new_from_string(
+                                    p->xkb_context, source, XKB_KEYMAP_FORMAT_TEXT_V1,
+                                    XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(source, size);
+    if (!keymap) {
+        return;
+    }
+    struct xkb_state *state = xkb_state_new(keymap);
+    if (!state) {
+        xkb_keymap_unref(keymap);
+        return;
+    }
+
+    xkb_state_unref(p->xkb_state);
+    xkb_keymap_unref(p->xkb_keymap);
+    p->xkb_keymap = keymap;
+    p->xkb_state = state;
 }
 
 static void way_keyboard_enter(void *data, struct wl_keyboard *keyboard,
@@ -380,6 +413,14 @@ static void way_keyboard_key(void *data, struct wl_keyboard *keyboard,
     Plat *p = data;
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         p->handlers.key(p->userdata, way_key(key), PLAT_PRESSED);
+        if (p->handlers.text && p->xkb_state) {
+            char utf8[64];
+            int length = xkb_state_key_get_utf8(p->xkb_state, key + 8,
+                                                utf8, sizeof(utf8));
+            if (length > 0 && (unsigned char)utf8[0] >= 0x20 && utf8[0] != 0x7F) {
+                p->handlers.text(p->userdata, utf8);
+            }
+        }
     } else if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
         p->handlers.key(p->userdata, way_key(key), PLAT_RELEASED);
     }
@@ -389,13 +430,13 @@ static void way_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
                                    uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
                                    uint32_t mods_locked, uint32_t group)
 {
-    (void)data;
     (void)keyboard;
     (void)serial;
-    (void)mods_depressed;
-    (void)mods_latched;
-    (void)mods_locked;
-    (void)group;
+    Plat *p = data;
+    if (p->xkb_state) {
+        xkb_state_update_mask(p->xkb_state, mods_depressed, mods_latched,
+                              mods_locked, 0, 0, group);
+    }
 }
 
 static void way_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
@@ -735,6 +776,11 @@ Plat *plat_open(const PlatConfig *config, const PlatHandlers *handlers, void *us
     p->title = config->title;
     p->app_id = config->app_id;
     p->frame.ready = true;
+    p->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!p->xkb_context) {
+        plat_close(p);
+        return NULL;
+    }
 
     p->display = wl_display_connect(NULL);
     if (!p->display) {
@@ -789,6 +835,9 @@ void plat_close(Plat *p)
         eglTerminate(p->egl_display);
     }
     free(p->damage_rects);
+    xkb_state_unref(p->xkb_state);
+    xkb_keymap_unref(p->xkb_keymap);
+    xkb_context_unref(p->xkb_context);
 
     /* Their surfaces and buffers must die before their globals and display. */
     for (int c = 0; c < p->cursor_count; c++) {

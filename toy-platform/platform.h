@@ -44,6 +44,8 @@ typedef enum {
     PLAT_KEY_OTHER,
     PLAT_KEY_Q,
     PLAT_KEY_ESC,
+    PLAT_KEY_ENTER,
+    PLAT_KEY_BACKSPACE,
     PLAT_KEY_M,
     PLAT_KEY_A,
     PLAT_KEY_P,
@@ -90,6 +92,8 @@ typedef struct {
     /* The pointer device is gone; no release will follow a held button. */
     void (*pointer_lost)(void *userdata);
     void (*key)(void *userdata, PlatKey key, PlatPress press);
+    /* Layout-aware UTF-8 text; control keys stay in key(). */
+    void (*text)(void *userdata, const char *utf8);
     /* Focus left; no release will follow a held key. */
     void (*keyboard_lost)(void *userdata);
     void (*resize)(void *userdata, int width, int height);
