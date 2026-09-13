@@ -118,6 +118,8 @@ static void test_keyboard_text(void)
     CHECK(way_key(KEY_ENTER) == PLAT_KEY_ENTER, "enter was not mapped");
     CHECK(way_key(KEY_BACKSPACE) == PLAT_KEY_BACKSPACE,
           "backspace was not mapped");
+    CHECK(way_key(KEY_DELETE) == PLAT_KEY_DELETE,
+          "delete was not mapped");
 
     xkb_state_unref(p.xkb_state);
     xkb_keymap_unref(p.xkb_keymap);

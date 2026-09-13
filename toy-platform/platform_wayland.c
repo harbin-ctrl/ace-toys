@@ -126,6 +126,8 @@ static PlatKey way_key(uint32_t key)
         return PLAT_KEY_ENTER;
     case KEY_BACKSPACE:
         return PLAT_KEY_BACKSPACE;
+    case KEY_DELETE:
+        return PLAT_KEY_DELETE;
     case KEY_M:
         return PLAT_KEY_M;
     case KEY_A:

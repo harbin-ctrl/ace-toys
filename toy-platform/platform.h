@@ -46,6 +46,7 @@ typedef enum {
     PLAT_KEY_ESC,
     PLAT_KEY_ENTER,
     PLAT_KEY_BACKSPACE,
+    PLAT_KEY_DELETE,
     PLAT_KEY_M,
     PLAT_KEY_A,
     PLAT_KEY_P,

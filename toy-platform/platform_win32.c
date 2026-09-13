@@ -74,6 +74,7 @@ enum {
     WIN_SC_LEFT = 0x4B,
     WIN_SC_RIGHT = 0x4D,
     WIN_SC_DOWN = 0x50,
+    WIN_SC_DELETE = 0x53,
 };
 
 typedef enum {
@@ -141,6 +142,8 @@ static PlatKey win_key(LPARAM lp)
             return PLAT_KEY_LEFT;
         case WIN_SC_RIGHT:
             return PLAT_KEY_RIGHT;
+        case WIN_SC_DELETE:
+            return PLAT_KEY_DELETE;
         default:
             return PLAT_KEY_OTHER;
         }
