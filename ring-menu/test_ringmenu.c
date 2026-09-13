@@ -47,9 +47,52 @@ static void test_group_selects_one(void) {
     ringmenu_destroy(menu);
 }
 
+/* Touchpads and some mouse drivers deliver a right click's press and release
+   together, so the menu must survive a release that never left the centre. */
+static void test_click_keeps_open(void) {
+    RingMenuItem items[] = {{.label = "one"}, {.label = "two"}};
+    RingMenu *menu = ringmenu_create(items, 2);
+    assert(menu);
+    ringmenu_open(menu, 100, 100, 200, 200);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, true) == RINGMENU_NONE);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, false) == RINGMENU_NONE);
+    assert(ringmenu_is_open(menu));
+    move_to(menu, 1, 2);
+    assert(ringmenu_button(menu, RINGMENU_BTN_LEFT, true) == 2);
+    assert(!ringmenu_is_open(menu));
+    ringmenu_destroy(menu);
+}
+
+static void test_second_click_in_centre_cancels(void) {
+    RingMenuItem items[] = {{.label = "one"}, {.label = "two"}};
+    RingMenu *menu = ringmenu_create(items, 2);
+    assert(menu);
+    ringmenu_open(menu, 100, 100, 200, 200);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, false) == RINGMENU_NONE);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, true) == RINGMENU_NONE);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, false) == RINGMENU_CANCELLED);
+    assert(!ringmenu_is_open(menu));
+    ringmenu_destroy(menu);
+}
+
+static void test_drag_back_to_centre_cancels(void) {
+    RingMenuItem items[] = {{.label = "one"}, {.label = "two"}};
+    RingMenu *menu = ringmenu_create(items, 2);
+    assert(menu);
+    ringmenu_open(menu, 100, 100, 200, 200);
+    move_to(menu, 0, 2);
+    ringmenu_motion(menu, 100, 100);
+    assert(ringmenu_button(menu, RINGMENU_BTN_RIGHT, false) == RINGMENU_CANCELLED);
+    assert(!ringmenu_is_open(menu));
+    ringmenu_destroy(menu);
+}
+
 int main(void) {
     test_grayed_item_stays_open();
     test_group_selects_one();
+    test_click_keeps_open();
+    test_second_click_in_centre_cancels();
+    test_drag_back_to_centre_cancels();
     puts("ringmenu checks passed");
     return 0;
 }

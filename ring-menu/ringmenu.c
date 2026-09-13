@@ -156,6 +156,8 @@ struct RingMenu {
     int cx, cy;     // menu center in screen coordinates
     int highlight;  // slot under the pointer, or -1
     int last_x, last_y;
+    bool left_center;   // the pointer has been outside the center hole
+    bool held_open;     // a click released in the center keeps the menu up
 };
 
 static uint32_t rm_pack(const uint8_t c[4], uint8_t a) {
@@ -239,6 +241,12 @@ static int rm_hit(const RingMenu *m, int x, int y) {
     float r = sqrtf(fx * fx + fy * fy);
     if (r < m->r0 || r > m->r1) return -1;
     return rm_slot_of(m, fx, fy);
+}
+
+static bool rm_in_center(const RingMenu *m, int x, int y) {
+    float fx = (float)x - (float)m->cx;
+    float fy = (float)y - (float)m->cy;
+    return sqrtf(fx * fx + fy * fy) < m->r0;
 }
 
 static bool rm_active(const RingMenu *m, int slot) {
@@ -713,6 +721,8 @@ void ringmenu_open(RingMenu *m, int x, int y, int bounds_w, int bounds_h) {
     m->last_x = x;
     m->last_y = y;
     m->highlight = -1;
+    m->left_center = false;
+    m->held_open = false;
     m->open = true;
     m->dirty = true;
     m->needs_render = true;
@@ -727,6 +737,9 @@ int ringmenu_motion(RingMenu *m, int x, int y) {
     if (!m || !m->open) return RINGMENU_NONE;
     m->last_x = x;
     m->last_y = y;
+    if (!rm_in_center(m, x, y)) {
+        m->left_center = true;
+    }
     int slot = rm_hit(m, x, y);
     if (slot >= 0 && !rm_active(m, slot)) {
         slot = -1;
@@ -751,6 +764,14 @@ int ringmenu_button(RingMenu *m, int button, bool pressed) {
 
     if (button == RINGMENU_BTN_MIDDLE && pressed) {
         return rm_close(m, RINGMENU_CANCELLED);
+    }
+    // A click rather than a drag: released before the pointer left the center.
+    // Touchpads and some drivers send press and release together, so stay open
+    // and let a second click choose.
+    if (button == RINGMENU_BTN_RIGHT && !pressed && !m->held_open && !m->left_center &&
+        rm_in_center(m, m->last_x, m->last_y)) {
+        m->held_open = true;
+        return RINGMENU_NONE;
     }
     // Releasing the right button and pressing the left one both commit:
     // select the slot under the pointer, cancel if there isn't one.

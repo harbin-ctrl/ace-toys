@@ -24,8 +24,11 @@ it works the same under Wayland, SDL, or anything else.
   under the pointer.
 - Release the right button (or press the left button) over a wedge: that item
   is selected — `ringmenu_button()` returns its 1-based index.
-- Release over the center hole or outside the ring, or press the middle
-  button: cancelled — returns `0` (`RINGMENU_CANCELLED`).
+- Right-click without dragging (released before the pointer leaves the center
+  hole): the menu stays open. Click a wedge to select it.
+- Release over the center hole after that or after dragging, release outside
+  the ring, or press the middle button: cancelled — returns `0`
+  (`RINGMENU_CANCELLED`).
 - While nothing has been decided, events return `RINGMENU_NONE` (-1).
 
 ## Items
