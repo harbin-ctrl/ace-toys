@@ -12,6 +12,9 @@ TOYPLATFORM_LIB := $(TOYPLATFORM_DIR)/libtoyplatform.a
 PKG_CONFIG ?= pkg-config
 
 # Windows means OS=Windows_NT (cmd) or MSYSTEM set (an MSYS2 shell).
+# SerenityOS means its cross compiler: make CC=x86_64-serenity-gcc CXX=x86_64-serenity-g++
+TOY_TARGET_MACHINE := $(shell $(CC) -dumpmachine 2>/dev/null)
+TOY_LINK = $(CC)
 ifneq ($(OS)$(MSYSTEM),)
 PLATFORM := win32
 EXE := .exe
@@ -20,6 +23,17 @@ TOY_PLATFORM_BACKEND_CFLAGS :=
 TOY_PLATFORM_LIBS := -lEGL -lGLESv2 -lgdi32 -luser32
 # A GUI program: launched from the Start menu, it opens no console window.
 APP_LDFLAGS := -mwindows
+else ifneq ($(findstring serenity,$(TOY_TARGET_MACHINE)),)
+PLATFORM := serenity
+EXE :=
+# gles2_soft.c stands in for GL ES 2; its gl2.h lives under serenity/.
+TOY_PLATFORM_BACKEND_CFLAGS := -I$(TOYPLATFORM_DIR)/serenity
+include $(TOYPLATFORM_DIR)/serenity.mk
+TOY_PLATFORM_CXXFLAGS := $(SERENITY_CXXFLAGS) -I$(TOYPLATFORM_DIR)
+TOY_PLATFORM_LIBS := -lgui -lgfx -lcore -lcorebasic -lcoreminimal -lipc
+# The backend is C++, so the toy links as C++.
+TOY_LINK = $(CXX)
+APP_LDFLAGS :=
 else
 PLATFORM := wayland
 EXE :=

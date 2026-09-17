@@ -43,6 +43,9 @@ include $(WIN_DIR)/install.mk
 include $(TOYAUDIO_DIR)/wasapi.mk
 TOY_AUDIO_CFLAGS := $(TOY_AUDIO_WASAPI_CFLAGS)
 TOY_AUDIO_LIBS := $(TOY_AUDIO_WASAPI_LIBS)
+else ifeq ($(PLATFORM),serenity)
+include $(TOYAUDIO_DIR)/serenity.mk
+TOY_AUDIO_LIBS := $(TOY_AUDIO_SERENITY_LIBS)
 else
 include $(TOYAUDIO_DIR)/pipewire.mk
 TOY_AUDIO_CFLAGS := $(TOY_AUDIO_PIPEWIRE_CFLAGS)
@@ -59,7 +62,7 @@ TOY_LIBS := $(RINGMENU_LIB) $(TOYAUDIO_LIB) $(GHOSTICON_LIB) $(TOYPLATFORM_LIB)
 all: $(TARGETS)
 
 poingo$(EXE): $(POINGO_SRC:.c=.o) $(POINGO_RES) $(TOY_LIBS)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(APP_LDFLAGS)
+	$(TOY_LINK) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(APP_LDFLAGS)
 
 # The ring menu, audio core and platform layer live in their own library
 # checkouts; delegate so they rebuild whenever their sources change.

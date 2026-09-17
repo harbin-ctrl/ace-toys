@@ -17,6 +17,8 @@ CFLAGS += -std=c11 -Wall -Wextra -Wshadow -pedantic -D_GNU_SOURCE -D_DEFAULT_SOU
 
 ifeq ($(PLATFORM),win32)
 OBJS := platform_win32.o
+else ifeq ($(PLATFORM),serenity)
+OBJS := platform_serenity.o gles2_soft.o
 else
 # Wayland protocol glue is generated, not checked in.
 PROTOCOL_SRC := xdg-shell-protocol.c xdg-decoration-protocol.c
@@ -31,6 +33,13 @@ libtoyplatform.a: $(OBJS)
 
 platform_win32.o: platform_win32.c platform.h
 	$(CC) $(CFLAGS) -c platform_win32.c -o $@
+
+platform_serenity.o: platform_serenity.cpp platform.h gles2_soft.h
+	$(CXX) $(TOY_PLATFORM_CXXFLAGS) -c platform_serenity.cpp -o $@
+
+# Every pixel of every sprite runs through it; -O3 vectorises the scalar path.
+gles2_soft.o: gles2_soft.c gles2_soft.h serenity/GLES2/gl2.h
+	$(CC) $(CFLAGS) -O3 -c gles2_soft.c -o $@
 
 platform_wayland.o: platform_wayland.c platform.h $(PROTOCOL_HDR)
 	$(CC) $(CFLAGS) -c platform_wayland.c -o $@
@@ -57,9 +66,9 @@ xdg-decoration-client-protocol.h:
 xdg-decoration-protocol.c:
 	wayland-scanner private-code $(XDG_DECORATION_XML) $@
 
-ifeq ($(PLATFORM),win32)
+ifneq ($(filter win32 serenity,$(PLATFORM)),)
 test:
-	@echo "toy-platform: the Win32 layer has no headless tests"
+	@echo "toy-platform: the $(PLATFORM) layer has no headless tests"
 else
 # Headless: test_platform_wayland.c includes platform_wayland.c and calls its
 # listeners directly, so nothing here connects to a compositor.
