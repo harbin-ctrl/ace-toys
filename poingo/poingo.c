@@ -1095,16 +1095,16 @@ static bool init_audio(bool start_muted) {
     };
     g_audio_stream = toy_audio_stream_start(&stream_config);
     if (unlikely(!g_audio_stream)) {
+        /* A debugging aid for machines without sound: run silent rather than
+           not at all. The mixer stays, so volume and mute still work. */
         fprintf(stderr,
-                "poingo: failed to start audio; quitting\n");
-        shutdown_audio();
-        return false;
+                "poingo: no audio output; running silent\n");
     }
     return true;
 }
 
 static bool play_pair(const ToySamplePair *pair, float gain, float pan) {
-    if (!pair) {
+    if (!pair || !g_audio_stream) {
         return false;
     }
 
@@ -1136,6 +1136,11 @@ static bool play_pair(const ToySamplePair *pair, float gain, float pan) {
 }
 
 static bool play_bounce_sound(int volume, float pan) {
+    /* Silent: skip rebuilding a sound nothing will play. */
+    if (!g_audio_stream) {
+        return false;
+    }
+
     BallAudio *audio = current_ball_audio();
     float size_scale = fmaxf(audio->current_size_scale, 0.05f);
 

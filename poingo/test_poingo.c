@@ -10,6 +10,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/* No audio device: the stream never starts. Replaces the platform stream, so
+   nothing in the tests opens real audio. */
+ToyAudioStream *toy_audio_stream_start(const ToyAudioStreamConfig *config) {
+    (void)config;
+    return NULL;
+}
+
+void toy_audio_stream_stop(ToyAudioStream *stream) {
+    (void)stream;
+}
+
+bool toy_audio_stream_get_latency(const ToyAudioStream *stream, double *seconds) {
+    (void)stream;
+    (void)seconds;
+    return false;
+}
+
+bool toy_audio_stream_is_ready(const ToyAudioStream *stream) {
+    (void)stream;
+    return false;
+}
+
 static int g_failures = 0;
 
 #define CHECK(cond, ...)                                              \
@@ -505,6 +527,21 @@ static void test_regen_survives_worker_failure(void) {
     regen_state_free(&st, &frames);
 }
 
+/* A machine without audio output still runs the toy, silently: startup
+   succeeds, sounds are dropped, and the volume controls keep working. */
+static void test_runs_without_audio_device(void) {
+    CHECK(init_audio(false), "startup failed without an audio device");
+    CHECK(g_audio_stream == NULL, "a stream exists without a device");
+    CHECK(!play_bounce_sound(32, 0.5f), "a bounce played without a device");
+
+    set_master_mute(true);
+    CHECK(g_volume_muted, "mute stopped working without a device");
+    set_master_mute(false);
+    adjust_master_volume(0.1f);
+
+    shutdown_audio();
+}
+
 int main(void) {
     srandom(1);
 
@@ -523,6 +560,7 @@ int main(void) {
     test_regen_shutdown_joins_workers();
     test_color_change_joins_before_palette();
     test_regen_survives_worker_failure();
+    test_runs_without_audio_device();
 
     release_sphere_pixel_cache();
 
