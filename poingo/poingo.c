@@ -292,6 +292,8 @@ static uint8_t g_color_dark_rgb[3] = { COLOR_DARK_R, COLOR_DARK_G, COLOR_DARK_B 
 static uint8_t g_grid_color_rgb[3] = { GRID_COLOR_R, GRID_COLOR_G, GRID_COLOR_B };
 static uint32_t g_color_drop_light[POINGO_MENU_DISC * POINGO_MENU_DISC];
 static uint32_t g_color_drop_dark[POINGO_MENU_DISC * POINGO_MENU_DISC];
+static bool g_damage_rects = false;
+static int g_start_balls = 1;
 
 static void poingo_menu_set_drop(int slot, const uint8_t rgb[3]) {
     if (!g_menu) return;
@@ -5040,6 +5042,8 @@ static int run_freerange(bool start_muted) {
     first_ball->vx = get_natural_vx(st.width);
     first_ball->vx_direction = 1;
     st.ball_count = 1;
+    while (st.ball_count < g_start_balls && add_ball(&st)) {
+    }
     st.shutdown_pending = false;
     st.exit_fade = 0.0f;
     st.ball_cleared = false;
@@ -5071,7 +5075,9 @@ static int run_freerange(bool start_muted) {
     double delta_error_accum = 0.0;
 
     #define FREERANGE_DAMAGE_HISTORY 8
-    FreerangeRect damage_hist[FREERANGE_DAMAGE_HISTORY] = {0};
+    #define FREERANGE_MAX_DAMAGE_RECTS (POINGO_MAX_BALLS + 3)
+    FreerangeRect damage_hist[FREERANGE_DAMAGE_HISTORY][FREERANGE_MAX_DAMAGE_RECTS] = {0};
+    int damage_hist_counts[FREERANGE_DAMAGE_HISTORY] = {0};
     int damage_hist_depth = 0;
 
     bool  in_reg_ghost = false;
@@ -5550,6 +5556,8 @@ static int run_freerange(bool start_muted) {
             bool menu_active = menu_open || g_menu_was_open;
 
             FreerangeRect cur_rect = {0, 0, 0, 0};
+            FreerangeRect current_damage[FREERANGE_MAX_DAMAGE_RECTS] = {0};
+            int current_damage_count = 0;
             {
                 for (int i = 0; i < st.ball_count; i++) {
                     float bx, by, bw, bh;
@@ -5563,16 +5571,19 @@ static int run_freerange(bool start_muted) {
                         (int)ceilf(bw) + 4, (int)ceilf(bh) + 4
                     };
                     freerange_rect_union(&cur_rect, &br);
+                    current_damage[current_damage_count++] = br;
                 }
                 if (hud_visible && st.gl_hud_w > 0 && st.gl_hud_h > 0) {
                     FreerangeRect hr = { (int)floorf(st.hud_x) - 2,
                                          (int)floorf(st.hud_y) - 2,
                                          st.gl_hud_w + 4, st.gl_hud_h + 4 };
                     freerange_rect_union(&cur_rect, &hr);
+                    current_damage[current_damage_count++] = hr;
                 }
                 if (st.ghost_mode && (!st.ball_cleared || st.shutdown_pending)) {
                     FreerangeRect br = { st.width - GHOST_ICON_SIZE - GHOST_ICON_MARGIN, GHOST_ICON_MARGIN, GHOST_ICON_SIZE, GHOST_ICON_SIZE };
                     freerange_rect_union(&cur_rect, &br);
+                    current_damage[current_damage_count++] = br;
                 }
                 /* The menu used to damage the whole screen, which made the
                    compositor recomposite 1920x1080 every frame it was up and
@@ -5583,10 +5594,12 @@ static int run_freerange(bool start_muted) {
                     FreerangeRect mr = { full[0] - 2, full[1] - 2,
                                          full[2] + 4, full[3] + 4 };
                     freerange_rect_union(&cur_rect, &mr);
+                    current_damage[current_damage_count++] = mr;
                 } else if (menu_active && g_menu_rect[2] > 0) {
                     FreerangeRect mr = { g_menu_rect[0] - 2, g_menu_rect[1] - 2,
                                          g_menu_rect[2] + 4, g_menu_rect[3] + 4 };
                     freerange_rect_union(&cur_rect, &mr);
+                    current_damage[current_damage_count++] = mr;
                 }
                 freerange_rect_clamp(&cur_rect, st.width, st.height);
             }
@@ -5596,7 +5609,9 @@ static int run_freerange(bool start_muted) {
             int age = plat_buffer_age(st.plat);
             if (age >= 1 && age <= damage_hist_depth) {
                 for (int i = 0; i < age; i++) {
-                    freerange_rect_union(&repaint, &damage_hist[i]);
+                    for (int j = 0; j < damage_hist_counts[i]; j++) {
+                        freerange_rect_union(&repaint, &damage_hist[i][j]);
+                    }
                 }
                 freerange_rect_clamp(&repaint, st.width, st.height);
                 repaint_full = false;
@@ -5871,19 +5886,36 @@ static int run_freerange(bool start_muted) {
                 gf_M2   += gd1 * (gf_ms - gf_mean);
                 if (gf_ms > gf_max) gf_max = gf_ms;
             }
-            FreerangeRect swap_dmg = cur_rect;
-            if (damage_hist_depth >= 1) {
-                freerange_rect_union(&swap_dmg, &damage_hist[0]);
+            PlatRect damage[FREERANGE_MAX_DAMAGE_RECTS * 2];
+            int damage_count = 0;
+            if (damage_hist_depth >= 1 && g_damage_rects) {
+                for (int i = 0; i < current_damage_count; i++) {
+                    freerange_rect_clamp(&current_damage[i], st.width, st.height);
+                    damage[damage_count++] = (PlatRect) { current_damage[i].x, current_damage[i].y, current_damage[i].w, current_damage[i].h };
+                }
+                for (int i = 0; i < damage_hist_counts[0]; i++) {
+                    damage[damage_count++] = (PlatRect) { damage_hist[0][i].x, damage_hist[0][i].y, damage_hist[0][i].w, damage_hist[0][i].h };
+                }
+            } else {
+                FreerangeRect swap_dmg = cur_rect;
+                if (damage_hist_depth >= 1) {
+                    for (int i = 0; i < damage_hist_counts[0]; i++) {
+                        freerange_rect_union(&swap_dmg, &damage_hist[0][i]);
+                    }
+                }
+                freerange_rect_clamp(&swap_dmg, st.width, st.height);
+                if (damage_hist_depth >= 1 && swap_dmg.w > 0 && swap_dmg.h > 0) {
+                    damage[damage_count++] = (PlatRect) { swap_dmg.x, swap_dmg.y, swap_dmg.w, swap_dmg.h };
+                }
             }
-            freerange_rect_clamp(&swap_dmg, st.width, st.height);
-            PlatRect dmg = { swap_dmg.x, swap_dmg.y, swap_dmg.w, swap_dmg.h };
-            bool dmg_known = damage_hist_depth >= 1 && swap_dmg.w > 0 && swap_dmg.h > 0;
-            plat_swap(st.plat, &dmg, dmg_known ? 1 : 0);
+            plat_swap(st.plat, damage, damage_count);
 
             for (int i = FREERANGE_DAMAGE_HISTORY - 1; i > 0; i--) {
-                damage_hist[i] = damage_hist[i - 1];
+                memcpy(damage_hist[i], damage_hist[i - 1], sizeof(damage_hist[i]));
+                damage_hist_counts[i] = damage_hist_counts[i - 1];
             }
-            damage_hist[0] = cur_rect;
+            memcpy(damage_hist[0], current_damage, sizeof(current_damage));
+            damage_hist_counts[0] = current_damage_count;
             if (damage_hist_depth < FREERANGE_DAMAGE_HISTORY) {
                 damage_hist_depth++;
             }
@@ -5998,6 +6030,8 @@ static void poingo_print_usage(const char *program) {
            (double)FREEDOM_BALL_SCALE_MIN, (double)FREEDOM_BALL_SCALE_MAX);
     printf("  --audit-predict       Count expected and predicted impacts\n");
     printf("  --debug               Write performance diagnostics\n");
+    printf("  --damage-rects        Benchmark disjoint compositor damage\n");
+    printf("  --start-balls <n>     Start with 1 to %d balls (benchmarking)\n", POINGO_MAX_BALLS);
     printf("  --help, -h            Show this help message\n");
 }
 
@@ -6050,6 +6084,18 @@ static PoingoArgsResult poingo_parse_args(int argc, char *argv[], bool *start_mu
             g_freerange_ball_scale = (float)value;
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_debug_mode = true;
+        } else if (strcmp(argv[i], "--damage-rects") == 0) {
+            g_damage_rects = true;
+        } else if (strcmp(argv[i], "--start-balls") == 0) {
+            const char *value_text = poingo_option_value(argc, argv, &i);
+            char *end = NULL;
+            long value = value_text ? strtol(value_text, &end, 10) : 0;
+            if (!value_text || end == value_text || *end != '\0' ||
+                value < 1 || value > POINGO_MAX_BALLS) {
+                fprintf(stderr, "Invalid --start-balls (use 1 to %d)\n", POINGO_MAX_BALLS);
+                return POINGO_ARGS_ERROR;
+            }
+            g_start_balls = (int)value;
         } else if (strcmp(argv[i], "--audit-predict") == 0) {
             g_predict_audit = true;
         } else {

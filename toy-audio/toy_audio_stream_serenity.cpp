@@ -50,7 +50,7 @@ static constexpr double SER_MIXER_FRAMES = 512.0;
    QEMU). A 30 ms target ran dry and clicked; this covers the worst gap with
    margin. The toy schedules sounds by the reported latency, so they still
    land on their impacts. */
-static constexpr double SER_TARGET_SECONDS = 0.060;
+static constexpr double SER_TARGET_SECONDS = 0.080;
 /* How long the thread asks to sleep between top-ups. */
 static constexpr long SER_TOP_UP_NS = 5'000'000;
 static constexpr u64 SER_NS_PER_SEC = 1'000'000'000;
