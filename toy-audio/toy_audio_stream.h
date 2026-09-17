@@ -10,6 +10,11 @@ typedef void (*ToyAudioRenderCallback)(void *userdata, float *output,
                                        uint32_t nframes,
                                        uint32_t channels);
 
+typedef enum {
+    TOY_AUDIO_LOG_QUIET,
+    TOY_AUDIO_LOG_DEBUG,    /* backends may report underruns and timing */
+} ToyAudioLog;
+
 typedef struct {
     const char *name;
     const char *description;
@@ -17,6 +22,7 @@ typedef struct {
     uint32_t channels;
     ToyAudioRenderCallback render;
     void *userdata;
+    ToyAudioLog log;
 } ToyAudioStreamConfig;
 
 /*

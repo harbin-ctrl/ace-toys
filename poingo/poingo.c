@@ -1092,6 +1092,7 @@ static bool init_audio(bool start_muted) {
         .channels = 2,
         .render = poingo_audio_render,
         .userdata = NULL,
+        .log = g_debug_mode ? TOY_AUDIO_LOG_DEBUG : TOY_AUDIO_LOG_QUIET,
     };
     g_audio_stream = toy_audio_stream_start(&stream_config);
     if (unlikely(!g_audio_stream)) {
