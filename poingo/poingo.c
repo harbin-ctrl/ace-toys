@@ -3442,6 +3442,27 @@ static void freerange_rect_clamp(FreerangeRect *r, int width, int height) {
     if (r->h < 0) r->h = 0;
 }
 
+/* Keep the software renderer from blending a pixel twice. Adjacent damage
+   joins into one clip; separated balls remain separate clips. */
+static int freerange_rect_add_merged(FreerangeRect *rects, int count,
+                                     FreerangeRect rect) {
+    for (int i = 0; i < count;) {
+        FreerangeRect const *other = &rects[i];
+        bool separate = rect.x > other->x + other->w ||
+                        other->x > rect.x + rect.w ||
+                        rect.y > other->y + other->h ||
+                        other->y > rect.y + rect.h;
+        if (separate) {
+            i++;
+            continue;
+        }
+        freerange_rect_union(&rect, other);
+        rects[i] = rects[--count];
+    }
+    rects[count] = rect;
+    return count + 1;
+}
+
 static bool freerange_ball_dest_quad(const FreedomState *st, const PoingoBall *ball,
                                      const FreedomFrameSet *frames,
                                      float extrap_dt,
@@ -5616,15 +5637,51 @@ static int run_freerange(bool start_muted) {
                 freerange_rect_clamp(&repaint, st.width, st.height);
                 repaint_full = false;
             }
+
+            FreerangeRect render_damage[FREERANGE_MAX_DAMAGE_RECTS * 2];
+            int render_damage_count = 0;
+            bool render_disjoint = g_damage_rects && !repaint_full;
+            if (render_disjoint) {
+                for (int i = 0; i < current_damage_count; i++) {
+                    FreerangeRect rect = current_damage[i];
+                    freerange_rect_clamp(&rect, st.width, st.height);
+                    if (rect.w > 0 && rect.h > 0) {
+                        render_damage_count = freerange_rect_add_merged(
+                            render_damage, render_damage_count, rect);
+                    }
+                }
+                for (int i = 0; i < damage_hist_counts[0]; i++) {
+                    FreerangeRect rect = damage_hist[0][i];
+                    freerange_rect_clamp(&rect, st.width, st.height);
+                    if (rect.w > 0 && rect.h > 0) {
+                        render_damage_count = freerange_rect_add_merged(
+                            render_damage, render_damage_count, rect);
+                    }
+                }
+            }
             if (!repaint_full) {
                 glEnable(GL_SCISSOR_TEST);
-                glScissor(repaint.x, st.height - (repaint.y + repaint.h),
-                          repaint.w, repaint.h);
             }
 
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            freerange_gl_draw_frame(&st, &frames, render_extrap_dt);
+            if (render_disjoint) {
+                for (int i = 0; i < render_damage_count; i++) {
+                    FreerangeRect const *rect = &render_damage[i];
+                    glScissor(rect->x, st.height - (rect->y + rect->h),
+                              rect->w, rect->h);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    freerange_gl_draw_frame(&st, &frames, render_extrap_dt);
+                }
+                glScissor(repaint.x, st.height - (repaint.y + repaint.h),
+                          repaint.w, repaint.h);
+            } else {
+                if (!repaint_full) {
+                    glScissor(repaint.x, st.height - (repaint.y + repaint.h),
+                              repaint.w, repaint.h);
+                }
+                glClear(GL_COLOR_BUFFER_BIT);
+                freerange_gl_draw_frame(&st, &frames, render_extrap_dt);
+            }
             if (hud_visible) {
                 freerange_gl_draw_hud(&st);
             }
